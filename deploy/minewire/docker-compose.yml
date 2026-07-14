@@ -1,0 +1,17 @@
+# Optional: Linux hosts with Docker.
+# This Windows VoceChat host has no Docker; prefer install-wsl.sh instead.
+services:
+  minewire:
+    image: alpine:3.20
+    # Official image is not published; mount a downloaded binary:
+    # 1) download minewire-server-linux-amd64 into ./runtime/
+    # 2) docker compose up
+    working_dir: /etc/minewire
+    command: ["/usr/local/bin/minewire-server"]
+    volumes:
+      - ./runtime/server.yaml:/etc/minewire/server.yaml:ro
+      - ./runtime/server-icon.png:/etc/minewire/server-icon.png:ro
+      - ./runtime/minewire-server:/usr/local/bin/minewire-server:ro
+    ports:
+      - "25565:25565"
+    restart: unless-stopped

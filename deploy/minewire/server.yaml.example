@@ -1,0 +1,30 @@
+# Minewire Server Configuration (VoceChat sidecar example)
+# Copy to runtime/server.yaml and replace passwords.
+# Generate: openssl rand -hex 16   OR   PowerShell: -join ((1..16)|%{'{0:x2}' -f (Get-Random -Max 256)})
+
+listen_port: "25565"
+
+# Optional subscription HTTP (mw:// link helper). Leave commented if unused.
+#subs_listen_port: "25564"
+
+passwords:
+  - "REPLACE_WITH_OPENSSL_RAND_HEX_16": "vocechat-ops"
+
+version_name: "1.21.10"
+protocol_id: 773
+icon_path: "server-icon.png"
+motd: "§bVoceChat Tunnel\\n§eMinewire sidecar"
+
+max_players: 20
+online_min: 2
+online_max: 12
+
+# fast = max throughput; realistic = throttled (see upstream README)
+mode: "fast"
+realistic_bandwidth_kb: 128
+realistic_burst_kb: 512
+
+# Minewire dials *client-requested* targets after auth.
+# From WSL to VoceChat on the Windows host, clients should target
+# WindowsHostIP:3000 (not 127.0.0.1 inside WSL). See docs/MINEWIRE_TUNNEL.md.
+#upstream_socks5: "127.0.0.1:4000"
