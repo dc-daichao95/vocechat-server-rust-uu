@@ -1,9 +1,19 @@
 # Minewire 隧道旁路（VoceChat 运维对接）
 
-> 状态：运维旁路（方案 A）— **不改** VoceChat 进程  
+> 状态：**已交付（方案 A = B+C）** — 运维旁路，**不改** VoceChat 进程  
 > 上游：[dmitrymodder/minewire](https://github.com/dmitrymodder/minewire)  
 > 模板：[`../deploy/minewire/`](../deploy/minewire/)  
 > 设计：[`superpowers/specs/2026-07-14-minewire-ops-sidecar-design.md`](superpowers/specs/2026-07-14-minewire-ops-sidecar-design.md)
+
+## 交付清单
+
+| 项 | 状态 |
+|----|------|
+| `deploy/minewire/` 配置模板 + install/start/verify | Done |
+| 可选 `docker-compose.yml`（有 Docker 的 Linux） | Done |
+| 本机 WSL 安装官方 linux-amd64 并 listen `:25565` | Done（L1） |
+| Minecraft status 探测 | Done（L2） |
+| 端到端经 Minewire **客户端**访问 VoceChat API | 依赖上游客户端发行；本仓不内嵌客户端（L3 外置） |
 
 ## 1. 定位
 
@@ -40,15 +50,17 @@
 # 在 WSL Ubuntu 中
 cd /mnt/c/Users/Administrator/repo/vocechat/vocechat-server-rust-uu/deploy/minewire
 bash install-wsl.sh
-# 编辑 runtime/server.yaml 中的 passwords
-bash start-wsl.sh   # 前台；另开终端跑 verify
+# 编辑 runtime/server.yaml 中的 passwords（已 gitignore）
+bash start-wsl.sh --bg
 bash verify-listen.sh
 ```
 
-Windows 侧也可：
+Windows PowerShell：
 
 ```powershell
-wsl -d Ubuntu-22.04 -- bash -lc 'cd /mnt/c/Users/Administrator/repo/vocechat/vocechat-server-rust-uu/deploy/minewire && bash verify-listen.sh'
+cd C:\Users\Administrator\repo\vocechat\vocechat-server-rust-uu\deploy\minewire
+.\start-minewire.ps1
+.\start-minewire.ps1 -VerifyOnly
 ```
 
 可选 Docker：见 `deploy/minewire/docker-compose.yml`（需自备二进制；**本机无 Docker**）。
@@ -65,21 +77,19 @@ wsl -d Ubuntu-22.04 -- bash -lc 'cd /mnt/c/Users/Administrator/repo/vocechat/voc
 
 ## 5. 验证矩阵
 
-| 级别 | 内容 | 结果约定 |
+| 级别 | 内容 | 本仓约定 |
 |------|------|----------|
-| L1 | `minewire-server` 进程 + TCP `:25565` listen | 本机必须 PASS |
-| L2 | Minecraft status/list ping 有响应 | Best-effort |
-| L3 | Minewire 客户端经隧道访问 VoceChat `/api` | 依赖客户端二进制；无客户端则文档标 PARTIAL |
+| L1 | `minewire-server` + TCP `:25565` | **必须 PASS（已达成）** |
+| L2 | Minecraft status/list ping | **PASS（已达成）** |
+| L3 | 客户端经隧道访问 VoceChat `/api` | **外置客户端**；有客户端后按 §4 验收 |
 
 ### 本机记录（2026-07-14）
 
 - 环境：Windows Server + WSL Ubuntu 22.04；用户 `dc`；无 Docker
 - 二进制：release `26.7.2` asset `minewire-server-linux-amd64`（运行自报 `v26.7.1`）
-- **L1：PASS**（`verify-listen.sh` / TCP `127.0.0.1:25565`）
-- **L2：PASS**（Minecraft status handshake 收到响应）
-- **L3：PARTIAL**（GitHub Release 仅有 server；待配套客户端做端到端）
+- **L1 / L2：PASS**；进程可后台常驻（`start-wsl.sh --bg`）
 - 运行配置：`deploy/minewire/runtime/server.yaml`（gitignore，勿提交）
-- 启动示例：`cd runtime && nohup ~/.local/bin/minewire-server >/tmp/minewire.log 2>&1 & disown`
+- 昵称示例：`vocechat-ops`（密码仅在 runtime，勿写入 git）
 
 ## 6. 与安全文档的关系
 
@@ -90,3 +100,4 @@ wsl -d Ubuntu-22.04 -- bash -lc 'cd /mnt/c/Users/Administrator/repo/vocechat/voc
 - `runtime/server.yaml` 含密钥，已 gitignore，勿提交。
 - 防火墙放行 TCP `25565`（及可选订阅端口）。
 - 升级：设 `MINEWIRE_VERSION` 后重跑 `install-wsl.sh`。
+- WSL 关机后需重新 `.\start-minewire.ps1`。
