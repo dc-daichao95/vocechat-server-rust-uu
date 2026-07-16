@@ -106,6 +106,7 @@ members = [
     "crates/fcm",
     "crates/open-graph",
     "crates/vc-license",
+    "crates/voce-e2ee-core",
 ]
 
 [dev-dependencies]

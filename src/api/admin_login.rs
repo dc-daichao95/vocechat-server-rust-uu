@@ -61,6 +61,7 @@ pub struct LoginConfig {
     #[serde(default = "default_e2e_default_on")]
     pub e2e_default_on: bool,
     /// Wire protocol version clients must implement for E2E
+    /// (`1` = v1 MK/P-256; `2` = v2 X3DH+ratchet — old clients get `E2E_UPGRADE_REQUIRED`)
     #[serde(default = "default_e2e_protocol_ver")]
     pub e2e_protocol_ver: i32,
 }

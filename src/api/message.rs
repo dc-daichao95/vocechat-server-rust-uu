@@ -21,7 +21,7 @@ use serde_json::Value;
 use crate::{
     api::{
         group::Group, resource::FileMeta, user::UserInfo, DateTime, FcmConfig, LangId,
-        PinnedMessage, UpdateAction,
+        LoginConfig, PinnedMessage, UpdateAction,
     },
     state::{BroadcastEvent, Cache, UserStatus},
     State,
@@ -912,8 +912,50 @@ async fn enforce_e2e_required(state: &State, payload: &ChatMessagePayload) -> po
     Ok(())
 }
 
+/// When server `e2e_protocol_ver` is 2+, reject encrypted sends with `e2e_ver` < required.
+async fn enforce_e2e_protocol_ver(state: &State, payload: &ChatMessagePayload) -> poem::Result<()> {
+    let required = state
+        .get_dynamic_config_instance::<LoginConfig>()
+        .await
+        .map(|c| c.e2e_protocol_ver)
+        .unwrap_or(1);
+    if required < 2 {
+        return Ok(());
+    }
+
+    let content = match &payload.detail {
+        MessageDetail::Normal(MessageNormal { content, .. })
+        | MessageDetail::Reply(MessageReply { content, .. }) => Some(content),
+        MessageDetail::Reaction(reaction) => match &reaction.detail {
+            MessageReactionDetail::Edit(edit) => Some(&edit.content),
+            MessageReactionDetail::Like(_) | MessageReactionDetail::Delete(_) => None,
+        },
+    };
+    let Some(content) = content else {
+        return Ok(());
+    };
+    if content.content_type != "vocechat/e2e" {
+        return Ok(());
+    }
+
+    let ver = content
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("e2e_ver"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1);
+    if ver < required as i64 {
+        return Err(Error::from_string(
+            "E2E_UPGRADE_REQUIRED",
+            StatusCode::FORBIDDEN,
+        ));
+    }
+    Ok(())
+}
+
 pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poem::Result<i64> {
     enforce_e2e_required(state, &payload).await?;
+    enforce_e2e_protocol_ver(state, &payload).await?;
 
     let cache = state.cache.read().await;
 
