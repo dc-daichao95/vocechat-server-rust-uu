@@ -23,6 +23,27 @@ pub struct RatchetHeader {
     pub n: u32,
 }
 
+/// Serializable ratchet session (persisted by clients via FFI/WASM JSON).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RatchetStateDto {
+    pub dhs_b64: String,
+    pub dhr_b64: Option<String>,
+    pub rk_b64: String,
+    pub cks_b64: Option<String>,
+    pub ckr_b64: Option<String>,
+    pub ns: u32,
+    pub nr: u32,
+    pub pn: u32,
+    pub mkskipped: Vec<SkippedMk>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedMk {
+    pub dh_pub_b64: String,
+    pub n: u32,
+    pub mk_b64: String,
+}
+
 #[derive(Clone)]
 pub struct RatchetState {
     pub dhs: StaticSecret,
@@ -34,6 +55,73 @@ pub struct RatchetState {
     pub nr: u32,
     pub pn: u32,
     pub mkskipped: HashMap<(String, u32), [u8; 32]>,
+}
+
+impl RatchetState {
+    pub fn to_dto(&self) -> RatchetStateDto {
+        RatchetStateDto {
+            dhs_b64: B64.encode(self.dhs.to_bytes()),
+            dhr_b64: self.dhr.map(|p| B64.encode(p.as_bytes())),
+            rk_b64: B64.encode(self.rk),
+            cks_b64: self.cks.map(|c| B64.encode(c)),
+            ckr_b64: self.ckr.map(|c| B64.encode(c)),
+            ns: self.ns,
+            nr: self.nr,
+            pn: self.pn,
+            mkskipped: self
+                .mkskipped
+                .iter()
+                .map(|((dh, n), mk)| SkippedMk {
+                    dh_pub_b64: dh.clone(),
+                    n: *n,
+                    mk_b64: B64.encode(mk),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn from_dto(dto: &RatchetStateDto) -> Result<Self, E2eError> {
+        let dhs_bytes: [u8; 32] = B64
+            .decode(&dto.dhs_b64)
+            .map_err(|e| E2eError::InvalidKey(e.to_string()))?
+            .try_into()
+            .map_err(|_| E2eError::InvalidKey("dhs len".into()))?;
+        let rk: [u8; 32] = B64
+            .decode(&dto.rk_b64)
+            .map_err(|e| E2eError::InvalidKey(e.to_string()))?
+            .try_into()
+            .map_err(|_| E2eError::InvalidKey("rk len".into()))?;
+        let decode32 = |s: &str| -> Result<[u8; 32], E2eError> {
+            B64.decode(s)
+                .map_err(|e| E2eError::InvalidKey(e.to_string()))?
+                .try_into()
+                .map_err(|_| E2eError::InvalidKey("32-byte field".into()))
+        };
+        let mut mkskipped = HashMap::new();
+        for s in &dto.mkskipped {
+            mkskipped.insert((s.dh_pub_b64.clone(), s.n), decode32(&s.mk_b64)?);
+        }
+        Ok(Self {
+            dhs: StaticSecret::from(dhs_bytes),
+            dhr: match &dto.dhr_b64 {
+                Some(b) => Some(decode_x25519_pub(b)?),
+                None => None,
+            },
+            rk,
+            cks: match &dto.cks_b64 {
+                Some(b) => Some(decode32(b)?),
+                None => None,
+            },
+            ckr: match &dto.ckr_b64 {
+                Some(b) => Some(decode32(b)?),
+                None => None,
+            },
+            ns: dto.ns,
+            nr: dto.nr,
+            pn: dto.pn,
+            mkskipped,
+        })
+    }
 }
 
 impl RatchetState {

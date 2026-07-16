@@ -12,7 +12,8 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 
 use crate::envelope::EnvelopeV2;
-use crate::identity::{safety_number, IdentityPublic, IdentitySecret};
+use crate::identity::{decode_x25519_pub, safety_number, IdentityPublic, IdentitySecret};
+use crate::ratchet::{RatchetHeader, RatchetState, RatchetStateDto};
 use crate::x3dh::{x3dh_initiator, x3dh_responder, PreKeyBundle, X3dhInitialMessage};
 
 fn ok(v: Value) -> String {
@@ -51,6 +52,12 @@ pub fn dispatch(method: &str, args: &Value) -> String {
             None => err("missing json"),
         },
         "v1_decrypt" => v1_decrypt(args),
+        "ratchet_init_alice" => ratchet_init_alice(args),
+        "ratchet_init_bob" => ratchet_init_bob(args),
+        "ratchet_encrypt" => ratchet_encrypt(args),
+        "ratchet_decrypt" => ratchet_decrypt(args),
+        "dm_session_open_initiator" => dm_session_open_initiator(args),
+        "dm_session_open_responder" => dm_session_open_responder(args),
         _ => err(format!("unknown method: {method}")),
     }
 }
@@ -136,6 +143,162 @@ fn v1_decrypt(args: &Value) -> String {
     let content = args["content_b64"].as_str().unwrap_or("");
     match crate::v1_compat::decrypt_v1_text(&d, my, content) {
         Ok(t) => ok(json!(t)),
+        Err(e) => err(e),
+    }
+}
+
+fn ratchet_init_alice(args: &Value) -> String {
+    let sk = match decode32(args, "shared_secret_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let bob_dh = match args["bob_dh_pub_b64"].as_str() {
+        Some(s) => match decode_x25519_pub(s) {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        },
+        None => return err("missing bob_dh_pub_b64"),
+    };
+    match RatchetState::init_alice(sk, &bob_dh) {
+        Ok(st) => ok(json!({ "state": st.to_dto() })),
+        Err(e) => err(e),
+    }
+}
+
+fn ratchet_init_bob(args: &Value) -> String {
+    let sk = match decode32(args, "shared_secret_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let spk = match decode32(args, "bob_spk_secret_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let st = RatchetState::init_bob(sk, spk);
+    ok(json!({ "state": st.to_dto() }))
+}
+
+fn parse_state(args: &Value) -> Result<RatchetState, String> {
+    let dto: RatchetStateDto =
+        serde_json::from_value(args["state"].clone()).map_err(|e| e.to_string())?;
+    RatchetState::from_dto(&dto).map_err(|e| e.to_string())
+}
+
+fn ratchet_encrypt(args: &Value) -> String {
+    let mut st = match parse_state(args) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let plaintext = args["plaintext"].as_str().unwrap_or("");
+    match st.encrypt(plaintext.as_bytes()) {
+        Ok((header, ct)) => ok(json!({
+            "state": st.to_dto(),
+            "header": header,
+            "ciphertext_b64": B64.encode(ct),
+        })),
+        Err(e) => err(e),
+    }
+}
+
+fn ratchet_decrypt(args: &Value) -> String {
+    let mut st = match parse_state(args) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let header: RatchetHeader = match serde_json::from_value(args["header"].clone()) {
+        Ok(h) => h,
+        Err(e) => return err(e),
+    };
+    let ct = match B64.decode(args["ciphertext_b64"].as_str().unwrap_or("")) {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    match st.decrypt(&header, &ct) {
+        Ok(pt) => match String::from_utf8(pt) {
+            Ok(s) => ok(json!({ "state": st.to_dto(), "plaintext": s })),
+            Err(e) => err(e),
+        },
+        Err(e) => err(e),
+    }
+}
+
+fn dm_session_open_initiator(args: &Value) -> String {
+    let alice_sec = match decode32(args, "alice_x25519_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let alice_pub: IdentityPublic = match serde_json::from_value(args["alice_public"].clone()) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let bundle: PreKeyBundle = match serde_json::from_value(args["bundle"].clone()) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let plaintext = args["plaintext"].as_str().unwrap_or("");
+    let (sk, initial, _) = match x3dh_initiator(&alice_sec, &alice_pub, &bundle) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let bob_dh = match decode_x25519_pub(&bundle.signed_prekey.dh_pub_b64) {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let mut st = match RatchetState::init_alice(sk.0, &bob_dh) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let (header, ct) = match st.encrypt(plaintext.as_bytes()) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    ok(json!({
+        "state": st.to_dto(),
+        "header": header,
+        "ciphertext_b64": B64.encode(ct),
+        "x3dh_initial": initial,
+        "used_signed_prekey_id": bundle.signed_prekey.key_id,
+    }))
+}
+
+fn dm_session_open_responder(args: &Value) -> String {
+    let bob_ik = match decode32(args, "bob_x25519_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let bob_spk = match decode32(args, "bob_spk_secret_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let otk = match args.get("bob_otk_secret_b64") {
+        Some(v) if !v.is_null() => match decode32(args, "bob_otk_secret_b64") {
+            Ok(b) => Some(b),
+            Err(e) => return err(e),
+        },
+        _ => None,
+    };
+    let initial: X3dhInitialMessage = match serde_json::from_value(args["x3dh_initial"].clone()) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let header: RatchetHeader = match serde_json::from_value(args["header"].clone()) {
+        Ok(h) => h,
+        Err(e) => return err(e),
+    };
+    let ct = match B64.decode(args["ciphertext_b64"].as_str().unwrap_or("")) {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let sk = match x3dh_responder(&bob_ik, &bob_spk, otk.as_ref(), &initial) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let mut st = RatchetState::init_bob(sk.0, bob_spk);
+    match st.decrypt(&header, &ct) {
+        Ok(pt) => match String::from_utf8(pt) {
+            Ok(s) => ok(json!({ "state": st.to_dto(), "plaintext": s })),
+            Err(e) => err(e),
+        },
         Err(e) => err(e),
     }
 }

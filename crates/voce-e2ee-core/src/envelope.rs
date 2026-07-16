@@ -32,6 +32,11 @@ pub enum EnvelopeV2Body {
     DoubleRatchet {
         header: RatchetHeader,
         ciphertext_b64: String,
+        /// Present on the first message of a new X3DH session (initiator → responder).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x3dh_initial: Option<crate::x3dh::X3dhInitialMessage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        used_signed_prekey_id: Option<u32>,
     },
     #[serde(rename = "SK+AES-GCM")]
     SenderKey {

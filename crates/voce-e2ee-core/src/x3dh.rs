@@ -19,7 +19,7 @@ pub struct PreKeyBundle {
     pub one_time_prekey_id: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct X3dhInitialMessage {
     pub identity_dh_pub_b64: String,
     pub ephemeral_pub_b64: String,
