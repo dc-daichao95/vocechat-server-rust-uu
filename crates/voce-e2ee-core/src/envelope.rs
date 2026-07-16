@@ -75,6 +75,31 @@ pub struct ReplayWindow {
     capacity: usize,
 }
 
+/// Client wire format for multi-device DM fan-out (JSON; not required by FFI).
+///
+/// ```json
+/// {
+///   "v": 2,
+///   "alg": "DR+AES-GCM",
+///   "sender_device_id": "...",
+///   "fanout": [
+///     { "device_id": "...", "uid": 1, "header": {...}, "ciphertext_b64": "...", "x3dh_initial": ... }
+///   ]
+/// }
+/// ```
+/// Legacy single-recipient messages keep top-level `header` / `ciphertext_b64`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrFanoutCopy {
+    pub device_id: String,
+    pub uid: i64,
+    pub header: RatchetHeader,
+    pub ciphertext_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x3dh_initial: Option<crate::x3dh::X3dhInitialMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_signed_prekey_id: Option<u32>,
+}
+
 impl ReplayWindow {
     pub fn new(capacity: usize) -> Self {
         Self {
