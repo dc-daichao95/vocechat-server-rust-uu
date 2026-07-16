@@ -88,7 +88,20 @@ impl ChatMessageContent {
             }
             "text/markdown" => Some("You have a new message".to_string()),
             "vocechat/file" => Some("You have a new file".to_string()),
-            _ => None,
+            "vocechat/e2e" => Some("You have a new message".to_string()),
+            _ => {
+                if self
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.get("e2e"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    Some("You have a new message".to_string())
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -402,6 +415,7 @@ pub struct GroupChangedMessage {
     pub owner: Option<i64>,
     pub avatar_updated_at: Option<DateTime>,
     pub is_public: Option<bool>,
+    pub e2e_enabled: Option<bool>,
 }
 
 /// Pinned message updated
@@ -545,6 +559,9 @@ pub enum SendMessageRequest {
     File(Json<FileInfo>),
     #[oai(content_type = "vocechat/archive")]
     Archive(PlainText<String>),
+    /// Opaque end-to-end encrypted envelope (server must not parse content)
+    #[oai(content_type = "vocechat/e2e")]
+    E2e(PlainText<String>),
 }
 
 impl SendMessageRequest {
@@ -599,6 +616,18 @@ impl SendMessageRequest {
                 content_type: "vocechat/archive".to_string(),
                 content: path.0,
             }),
+            SendMessageRequest::E2e(cipher) => {
+                let mut properties = properties.unwrap_or_default();
+                properties.insert("e2e".to_string(), Value::Bool(true));
+                if !properties.contains_key("e2e_ver") {
+                    properties.insert("e2e_ver".to_string(), Value::from(1));
+                }
+                Ok(ChatMessageContent {
+                    properties: Some(properties),
+                    content_type: "vocechat/e2e".to_string(),
+                    content: cipher.0,
+                })
+            }
         }
     }
 
@@ -629,6 +658,92 @@ pub fn decode_messages(rows: Vec<(i64, Vec<u8>)>) -> Vec<ChatMessage> {
                 .map(|payload| ChatMessage { mid, payload })
         })
         .collect()
+}
+
+/// True if plaintext/markdown body contains [query] (lowercase).
+pub fn message_matches_query(msg: &ChatMessage, query: &str) -> bool {
+    let content = match &msg.payload.detail {
+        MessageDetail::Normal(n) => Some(&n.content),
+        MessageDetail::Reply(r) => Some(&r.content),
+        MessageDetail::Reaction(_) => None,
+    };
+    match content {
+        Some(c)
+            if c.content_type == "text/plain" || c.content_type == "text/markdown" =>
+        {
+            c.content.to_lowercase().contains(query)
+        }
+        _ => false,
+    }
+}
+
+/// Walk conversation history newest→oldest applying optional time window.
+///
+/// - No time filters: same as a single mid-cursor page.
+/// - `before_ts` only (jump): return up to [limit] newest messages with
+///   `created_at <= before_ts`.
+/// - `after_ts` + optional `before_ts` (range): return up to [limit] newest
+///   messages inside the inclusive window.
+pub fn fetch_history_by_time(
+    fetch_page: impl Fn(Option<i64>, usize) -> poem::Result<Vec<(i64, Vec<u8>)>>,
+    before_mid: Option<i64>,
+    after_ts: Option<i64>,
+    before_ts: Option<i64>,
+    limit: usize,
+) -> poem::Result<Vec<ChatMessage>> {
+    if after_ts.is_none() && before_ts.is_none() {
+        return Ok(decode_messages(fetch_page(before_mid, limit)?));
+    }
+
+    let page_size = 200usize.max(limit);
+    let mut cursor = before_mid;
+    let mut matched: Vec<ChatMessage> = Vec::new();
+
+    for _ in 0..50 {
+        let rows = fetch_page(cursor, page_size)?;
+        if rows.is_empty() {
+            break;
+        }
+        let batch = decode_messages(rows);
+        if batch.is_empty() {
+            break;
+        }
+        let oldest_mid = batch.first().map(|m| m.mid);
+
+        // batch is ascending (oldest → newest)
+        let mut hit_too_old = false;
+        for msg in batch.into_iter().rev() {
+            let ts = msg.payload.created_at.timestamp_millis();
+            if let Some(b) = before_ts {
+                if ts > b {
+                    continue;
+                }
+            }
+            if let Some(a) = after_ts {
+                if ts < a {
+                    hit_too_old = true;
+                    break;
+                }
+            }
+            matched.push(msg);
+            if matched.len() >= limit {
+                break;
+            }
+        }
+
+        if matched.len() >= limit || hit_too_old {
+            break;
+        }
+
+        match oldest_mid {
+            Some(mid) if Some(mid) != cursor => cursor = Some(mid),
+            _ => break,
+        }
+    }
+
+    // matched is newest-first; reverse to ascending for clients
+    matched.reverse();
+    Ok(matched)
 }
 
 enum InternalSendMessageTarget {
@@ -749,7 +864,57 @@ fn internal_send_message(
     Ok(msg_id)
 }
 
+/// When a DM/channel session has E2E enabled, reject non-`vocechat/e2e` chat bodies.
+async fn enforce_e2e_required(state: &State, payload: &ChatMessagePayload) -> poem::Result<()> {
+    let content = match &payload.detail {
+        MessageDetail::Normal(MessageNormal { content, .. })
+        | MessageDetail::Reply(MessageReply { content, .. }) => Some(content),
+        MessageDetail::Reaction(reaction) => match &reaction.detail {
+            MessageReactionDetail::Edit(edit) => Some(&edit.content),
+            MessageReactionDetail::Like(_) | MessageReactionDetail::Delete(_) => None,
+        },
+    };
+    let Some(content) = content else {
+        return Ok(());
+    };
+    if content.content_type == "vocechat/e2e" {
+        return Ok(());
+    }
+
+    let required = match payload.target {
+        MessageTarget::User(MessageTargetUser { uid }) => {
+            let lo = payload.from_uid.min(uid);
+            let hi = payload.from_uid.max(uid);
+            sqlx::query_as::<_, (bool,)>(
+                "select e2e_enabled from e2e_dm_setting where uid_low = ? and uid_high = ?",
+            )
+            .bind(lo)
+            .bind(hi)
+            .fetch_optional(&state.db_pool)
+            .await
+            .map_err(InternalServerError)?
+            .map(|r| r.0)
+            .unwrap_or(true)
+        }
+        MessageTarget::Group(MessageTargetGroup { gid }) => {
+            let cache = state.cache.read().await;
+            cache
+                .groups
+                .get(&gid)
+                .map(|g| g.e2e_enabled)
+                .unwrap_or(true)
+        }
+    };
+
+    if required {
+        return Err(Error::from_string("E2E_REQUIRED", StatusCode::FORBIDDEN));
+    }
+    Ok(())
+}
+
 pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poem::Result<i64> {
+    enforce_e2e_required(state, &payload).await?;
+
     let cache = state.cache.read().await;
 
     // set expires_in

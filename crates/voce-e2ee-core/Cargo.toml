@@ -1,0 +1,21 @@
+[package]
+name = "voce-e2ee-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared E2EE v2 crypto core for VoceChat (WASM + FFI)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+
+# Phase B spike: add audited crypto deps after license review.
+# x25519-dalek = "2"
+# ed25519-dalek = "2"
+# aes-gcm = "0.10"
+
+[dev-dependencies]

@@ -54,10 +54,31 @@ pub struct LoginConfig {
     /// Login with third party
     #[serde(default)]
     pub third_party: bool,
+    /// Server advertises E2E capability to clients
+    #[serde(default = "default_e2e_available")]
+    pub e2e_available: bool,
+    /// When true, new DMs/channels encrypt by default (e2e_ver=1)
+    #[serde(default = "default_e2e_default_on")]
+    pub e2e_default_on: bool,
+    /// Wire protocol version clients must implement for E2E
+    #[serde(default = "default_e2e_protocol_ver")]
+    pub e2e_protocol_ver: i32,
 }
 
 const fn default_who_can_sign_up() -> WhoCanSignUp {
     WhoCanSignUp::EveryOne
+}
+
+const fn default_e2e_available() -> bool {
+    true
+}
+
+const fn default_e2e_default_on() -> bool {
+    true
+}
+
+const fn default_e2e_protocol_ver() -> i32 {
+    1
 }
 
 impl Default for LoginConfig {
@@ -72,6 +93,9 @@ impl Default for LoginConfig {
             oidc: vec![],
             metamask: false,
             third_party: false,
+            e2e_available: true,
+            e2e_default_on: true,
+            e2e_protocol_ver: 1,
         }
     }
 }

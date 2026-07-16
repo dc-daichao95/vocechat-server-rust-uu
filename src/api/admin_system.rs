@@ -71,6 +71,154 @@ impl Default for OrganizationConfig {
     }
 }
 
+/// Frontend-facing common settings (`GET/PUT /admin/system/common`).
+/// All fields are optional so partial PUT bodies (and JSON nulls) from the web UI parse cleanly.
+#[derive(Debug, Object, Serialize, Deserialize, Clone, Default)]
+pub struct SystemCommonConfig {
+    #[oai(default)]
+    pub show_user_online_status: Option<bool>,
+    #[oai(default)]
+    pub webclient_auto_update: Option<bool>,
+    #[oai(default)]
+    pub contact_verification_enable: Option<bool>,
+    #[oai(default)]
+    pub chat_layout_mode: Option<String>,
+    #[oai(default)]
+    pub max_file_expiry_mode: Option<String>,
+    #[oai(default)]
+    pub only_admin_can_create_group: Option<bool>,
+    #[oai(default)]
+    pub who_can_invite_users: Option<bool>,
+    #[oai(default)]
+    pub ext_setting: Option<String>,
+    #[oai(default)]
+    pub msg_smtp_notify_enable: Option<bool>,
+    #[oai(default)]
+    pub msg_smtp_notify_delay_seconds: Option<i32>,
+    #[oai(default)]
+    pub dm_enable: Option<bool>,
+    #[oai(default)]
+    pub add_friend_enable: Option<bool>,
+    #[oai(default)]
+    pub search_user_enable: Option<bool>,
+}
+
+impl SystemCommonConfig {
+    fn with_defaults(mut self) -> Self {
+        let d = Self::filled_defaults();
+        if self.show_user_online_status.is_none() {
+            self.show_user_online_status = d.show_user_online_status;
+        }
+        if self.webclient_auto_update.is_none() {
+            self.webclient_auto_update = d.webclient_auto_update;
+        }
+        if self.contact_verification_enable.is_none() {
+            self.contact_verification_enable = d.contact_verification_enable;
+        }
+        if self.chat_layout_mode.is_none() {
+            self.chat_layout_mode = d.chat_layout_mode;
+        }
+        if self.max_file_expiry_mode.is_none() {
+            self.max_file_expiry_mode = d.max_file_expiry_mode;
+        }
+        if self.only_admin_can_create_group.is_none() {
+            self.only_admin_can_create_group = d.only_admin_can_create_group;
+        }
+        if self.who_can_invite_users.is_none() {
+            self.who_can_invite_users = d.who_can_invite_users;
+        }
+        if self.msg_smtp_notify_enable.is_none() {
+            self.msg_smtp_notify_enable = d.msg_smtp_notify_enable;
+        }
+        if self.msg_smtp_notify_delay_seconds.is_none() {
+            self.msg_smtp_notify_delay_seconds = d.msg_smtp_notify_delay_seconds;
+        }
+        if self.dm_enable.is_none() {
+            self.dm_enable = d.dm_enable;
+        }
+        if self.add_friend_enable.is_none() {
+            self.add_friend_enable = d.add_friend_enable;
+        }
+        if self.search_user_enable.is_none() {
+            self.search_user_enable = d.search_user_enable;
+        }
+        self
+    }
+
+    fn filled_defaults() -> Self {
+        Self {
+            show_user_online_status: Some(true),
+            webclient_auto_update: Some(true),
+            contact_verification_enable: Some(false),
+            chat_layout_mode: Some("Left".to_string()),
+            max_file_expiry_mode: Some("Off".to_string()),
+            only_admin_can_create_group: Some(false),
+            who_can_invite_users: Some(true),
+            ext_setting: None,
+            msg_smtp_notify_enable: Some(false),
+            msg_smtp_notify_delay_seconds: Some(0),
+            dm_enable: Some(true),
+            add_friend_enable: Some(true),
+            search_user_enable: Some(true),
+        }
+    }
+
+    fn merge_patch(&mut self, patch: SystemCommonConfig) {
+        if patch.show_user_online_status.is_some() {
+            self.show_user_online_status = patch.show_user_online_status;
+        }
+        if patch.webclient_auto_update.is_some() {
+            self.webclient_auto_update = patch.webclient_auto_update;
+        }
+        if patch.contact_verification_enable.is_some() {
+            self.contact_verification_enable = patch.contact_verification_enable;
+        }
+        if patch.chat_layout_mode.is_some() {
+            self.chat_layout_mode = patch.chat_layout_mode;
+        }
+        if patch.max_file_expiry_mode.is_some() {
+            self.max_file_expiry_mode = patch.max_file_expiry_mode;
+        }
+        if patch.only_admin_can_create_group.is_some() {
+            self.only_admin_can_create_group = patch.only_admin_can_create_group;
+        }
+        if patch.who_can_invite_users.is_some() {
+            self.who_can_invite_users = patch.who_can_invite_users;
+        }
+        // ext_setting may be intentionally cleared with null — treat Some only; null/None keeps old
+        if patch.ext_setting.is_some() {
+            self.ext_setting = patch.ext_setting;
+        }
+        if patch.msg_smtp_notify_enable.is_some() {
+            self.msg_smtp_notify_enable = patch.msg_smtp_notify_enable;
+        }
+        if patch.msg_smtp_notify_delay_seconds.is_some() {
+            self.msg_smtp_notify_delay_seconds = patch.msg_smtp_notify_delay_seconds;
+        }
+        if patch.dm_enable.is_some() {
+            self.dm_enable = patch.dm_enable;
+        }
+        if patch.add_friend_enable.is_some() {
+            self.add_friend_enable = patch.add_friend_enable;
+        }
+        if patch.search_user_enable.is_some() {
+            self.search_user_enable = patch.search_user_enable;
+        }
+    }
+}
+
+impl DynamicConfig for SystemCommonConfig {
+    type Instance = Self;
+
+    fn name() -> &'static str {
+        "system-common"
+    }
+
+    fn create_instance(self, _config: &Config) -> Self::Instance {
+        self
+    }
+}
+
 #[derive(ApiRequest)]
 enum UploadLogoRequest {
     #[oai(content_type = "image/png")]
@@ -141,6 +289,46 @@ impl ApiAdminSystem {
     async fn initialized(&self, state: Data<&State>) -> Json<bool> {
         let cache = state.cache.read().await;
         Json(!cache.users.is_empty())
+    }
+
+    /// Get common frontend settings
+    #[oai(path = "/common", method = "get")]
+    async fn get_common(&self, state: Data<&State>) -> Result<Json<SystemCommonConfig>> {
+        let entry = state
+            .load_dynamic_config_with::<SystemCommonConfig, _>(|| DynamicConfigEntry {
+                enabled: true,
+                config: SystemCommonConfig::filled_defaults(),
+            })
+            .await?;
+        Ok(Json(entry.config.with_defaults()))
+    }
+
+    /// Update common frontend settings (partial body supported)
+    #[oai(path = "/common", method = "put")]
+    async fn put_common(
+        &self,
+        state: Data<&State>,
+        token: Token,
+        req: Json<SystemCommonConfig>,
+    ) -> Result<()> {
+        if !token.is_admin {
+            return Err(Error::from_status(StatusCode::FORBIDDEN));
+        }
+        let entry = state
+            .load_dynamic_config_with::<SystemCommonConfig, _>(|| DynamicConfigEntry {
+                enabled: true,
+                config: SystemCommonConfig::filled_defaults(),
+            })
+            .await?;
+        let mut config = entry.config.with_defaults();
+        config.merge_patch(req.0);
+        state
+            .set_dynamic_config(DynamicConfigEntry {
+                enabled: true,
+                config,
+            })
+            .await?;
+        Ok(())
     }
 
     /// Get the system metrics

@@ -72,6 +72,7 @@ Our team also provide customization service. We also provide resale license for 
 - [x] Favorate 
 - [x] Auto-delete my messages 
 - [x] Bot and Webhook (inbound and outbound)
+- [x] End-to-end encryption (MVP): public keys + opaque `vocechat/e2e` ciphertext, per-DM `e2e_enabled`, webhook plaintext redaction, `e2e_available` capability. Channel Sender Keys, voice/Agora, and in-process REALITY are out of scope (see `docs/SECURITY_E2E_AND_OBFUSCATION.md`)
 - [ ] Role based permission control
 - [ ] Post, based on ActivityPub
 - [ ] Matrix Bridge

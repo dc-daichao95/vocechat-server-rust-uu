@@ -139,6 +139,40 @@ impl<'a> Messages<'a> {
         Ok(msgs)
     }
 
+    /// Fetch up to [limit] of a user's messages with mid < [before] (desc then reversed).
+    pub fn fetch_user_messages_before(
+        &self,
+        uid: i64,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<(i64, Vec<u8>)>> {
+        let before_id = before.unwrap_or(i64::MAX);
+        let iter = self
+            .db
+            .db
+            .range(key_user_msg(uid, 0)..key_user_msg(uid, before_id))
+            .rev()
+            .take(limit);
+        let mut msgs = Vec::new();
+
+        for item in iter {
+            let (key, value) = item?;
+            let (current_uid, msg_id) = match decode_key_user_msg(&key) {
+                Some(res) => res,
+                None => break,
+            };
+
+            if current_uid != uid {
+                break;
+            }
+
+            msgs.push((msg_id, value.to_vec()));
+        }
+
+        msgs.reverse();
+        Ok(msgs)
+    }
+
     pub fn insert_merged_msg(&self, mid: i64, msg: &[u8]) -> Result<()> {
         self.db.db.insert(key_merged_msg(mid), msg)?;
         Ok(())

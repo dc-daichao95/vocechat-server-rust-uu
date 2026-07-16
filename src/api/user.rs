@@ -29,7 +29,8 @@ use crate::{
         admin_login::WhoCanSignUp,
         group::get_related_groups,
         message::{
-            decode_messages, parse_properties_from_base64, send_message, JoinedGroupMessage,
+            decode_messages, fetch_history_by_time, message_matches_query,
+            parse_properties_from_base64, send_message, JoinedGroupMessage,
             KickFromGroupMessage, KickReason, MessageTargetGroup, MessageTargetUser,
             PinnedMessageUpdated, RelatedGroupsMessage, SendMessageRequest, SessionReadyMessage,
             UserJoinedGroupMessage, UserLeavedGroupMessage, UserState, UsersSnapshotMessage,
@@ -297,6 +298,33 @@ struct SendRegMagicTokenRequest {
 pub struct SendRegMagicTokenResponse {
     new_magic_token: String,
     mail_is_sent: bool,
+}
+
+/// Contact status payload for web (`added` | `blocked` | ``).
+#[derive(Debug, Object, Clone)]
+struct ContactInfoDto {
+    status: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Object, Clone)]
+struct ContactResponse {
+    target_uid: i64,
+    target_info: UserInfo,
+    contact_info: ContactInfoDto,
+}
+
+#[derive(Debug, Object)]
+struct UpdateContactStatusRequest {
+    action: String,
+    target_uid: i64,
+}
+
+#[derive(Debug, Object)]
+struct ContactRemarkRequest {
+    contact_uid: i64,
+    remark: String,
 }
 
 pub struct ApiUser;
@@ -652,6 +680,87 @@ impl ApiUser {
         Ok(Json(user.api_user_info(token.uid)))
     }
 
+    /// Contact list (uu stub: empty until full contact table is wired).
+    /// Must be declared before `/:uid` so "contacts" is not parsed as uid.
+    #[oai(path = "/contacts", method = "get")]
+    async fn contacts(&self, _state: Data<&State>, _token: Token) -> Result<Json<Vec<ContactResponse>>> {
+        Ok(Json(Vec::new()))
+    }
+
+    /// Update contact status (uu stub: accept and no-op when contacts table absent).
+    #[oai(path = "/update_contact_status", method = "post")]
+    async fn update_contact_status(
+        &self,
+        state: Data<&State>,
+        token: Token,
+        req: Json<UpdateContactStatusRequest>,
+    ) -> Result<()> {
+        if req.target_uid == token.uid {
+            return Err(Error::from_status(StatusCode::BAD_REQUEST));
+        }
+        let cache = state.cache.read().await;
+        if !cache.users.contains_key(&req.target_uid) {
+            return Err(Error::from_status(StatusCode::NOT_FOUND));
+        }
+        match req.action.as_str() {
+            "add" | "remove" | "block" | "unblock" => Ok(()),
+            _ => Err(Error::from_status(StatusCode::BAD_REQUEST)),
+        }
+    }
+
+    /// Set contact remark (uu stub).
+    #[oai(path = "/contact_remark", method = "put")]
+    async fn contact_remark(
+        &self,
+        _state: Data<&State>,
+        _token: Token,
+        _req: Json<ContactRemarkRequest>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Search the current user's messages in a time window (global).
+    /// Must be declared before `/:uid` so "messages" is not parsed as uid.
+    ///
+    /// `after_ts` / `before_ts` are unix milliseconds. Optional `q` matches
+    /// plaintext/markdown content (E2E ciphertext is skipped).
+    #[oai(path = "/messages/by_time", method = "get")]
+    async fn search_messages_by_time(
+        &self,
+        state: Data<&State>,
+        token: Token,
+        after_ts: Query<Option<i64>>,
+        before_ts: Query<Option<i64>>,
+        q: Query<Option<String>>,
+        #[oai(default = "default_get_history_messages_limit")] limit: Query<usize>,
+    ) -> Result<Json<Vec<ChatMessage>>> {
+        let uid = token.uid;
+        let msg_db = state.msg_db.clone();
+        let mut msgs = fetch_history_by_time(
+            |cursor, lim| {
+                msg_db
+                    .messages()
+                    .fetch_user_messages_before(uid, cursor, lim)
+                    .map_err(InternalServerError)
+            },
+            None,
+            after_ts.0,
+            before_ts
+                .0
+                .or_else(|| Some(chrono::Utc::now().timestamp_millis())),
+            limit.0.min(500).max(1),
+        )?;
+        if let Some(query) = q
+            .0
+            .as_ref()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+        {
+            msgs.retain(|m| message_matches_query(m, &query));
+        }
+        Ok(Json(msgs))
+    }
+
     /// Get the specified user information
     #[oai(path = "/:uid", method = "get")]
     async fn get_user(&self, state: Data<&State>, uid: Path<i64>) -> Result<Json<UserInfo>> {
@@ -922,6 +1031,10 @@ impl ApiUser {
     }
 
     /// Get history messages
+    ///
+    /// Optional time filters (unix ms):
+    /// - `before_ts`: jump to / load messages at or before this time
+    /// - `after_ts`: only keep messages at or after this time (range with before_ts)
     #[oai(path = "/:uid/history", method = "get")]
     async fn get_history_messages(
         &self,
@@ -929,14 +1042,26 @@ impl ApiUser {
         token: Token,
         uid: Path<i64>,
         before: Query<Option<i64>>,
+        after_ts: Query<Option<i64>>,
+        before_ts: Query<Option<i64>>,
         #[oai(default = "default_get_history_messages_limit")] limit: Query<usize>,
     ) -> Result<Json<Vec<ChatMessage>>> {
-        let msgs = state
-            .msg_db
-            .messages()
-            .fetch_dm_messages_before(token.uid, uid.0, before.0, limit.0)
-            .map_err(InternalServerError)?;
-        Ok(Json(decode_messages(msgs)))
+        let from = token.uid;
+        let to = uid.0;
+        let msg_db = state.msg_db.clone();
+        let msgs = fetch_history_by_time(
+            |cursor, lim| {
+                msg_db
+                    .messages()
+                    .fetch_dm_messages_before(from, to, cursor, lim)
+                    .map_err(InternalServerError)
+            },
+            before.0,
+            after_ts.0,
+            before_ts.0,
+            limit.0.min(500),
+        )?;
+        Ok(Json(msgs))
     }
 
     /// Subscribe events

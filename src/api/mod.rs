@@ -11,6 +11,7 @@ mod admin_user;
 mod archive;
 mod bot;
 mod datetime;
+mod e2e;
 mod favorite;
 mod group;
 mod langid;
@@ -31,6 +32,7 @@ pub use admin_system::{FrontendUrlConfig, Metrics, OrganizationConfig};
 pub use admin_user::{User, UserDevice};
 pub use archive::Archive;
 pub use datetime::DateTime;
+pub use e2e::redact_e2e_chat_message_json;
 pub use group::{Group, PinnedMessage};
 pub use langid::LangId;
 pub use message::{
@@ -50,24 +52,30 @@ pub use user::{
 pub use user_log_action::UpdateAction;
 
 pub fn create_api_service() -> OpenApiService<impl OpenApi, ()> {
+    // poem-openapi OpenApi is implemented for tuples up to 16; nest past that.
     OpenApiService::new(
         (
-            token::ApiToken,
-            user::ApiUser,
-            group::ApiGroup,
-            admin_user::ApiAdminUser,
-            resource::ApiResource,
-            message_api::ApiMessage,
-            favorite::ApiFavorite,
-            license::ApiLicense,
-            admin_system::ApiAdminSystem,
-            admin_agora::ApiAdminAgora,
-            admin_fcm::ApiAdminFirebase,
-            admin_smtp::ApiAdminSmtp,
-            admin_login::ApiAdminLogin,
-            admin_google_auth::ApiAdminGoogleAuth,
-            admin_github_auth::ApiAdminGithubAuth,
-            bot::ApiBot,
+            (
+                token::ApiToken,
+                user::ApiUser,
+                e2e::ApiE2e,
+                group::ApiGroup,
+                admin_user::ApiAdminUser,
+                resource::ApiResource,
+                message_api::ApiMessage,
+                favorite::ApiFavorite,
+            ),
+            (
+                license::ApiLicense,
+                admin_system::ApiAdminSystem,
+                admin_agora::ApiAdminAgora,
+                admin_fcm::ApiAdminFirebase,
+                admin_smtp::ApiAdminSmtp,
+                admin_login::ApiAdminLogin,
+                admin_google_auth::ApiAdminGoogleAuth,
+                admin_github_auth::ApiAdminGithubAuth,
+                bot::ApiBot,
+            ),
         ),
         "Voce Chat",
         env!("CARGO_PKG_VERSION"),

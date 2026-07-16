@@ -1,0 +1,26 @@
+# Multi-stage build: Linux amd64 vocechat-server
+# Prefer Debian slim runtime so a normal glibc binary works (no musl/sudo required).
+#   docker build -f build/docker/Dockerfile.linux -t vocechat-server:latest .
+#   docker compose -f build/docker/docker-compose.e2e.yml up -d --build
+
+FROM rust:1.78-bookworm AS builder
+WORKDIR /src
+COPY . .
+RUN cargo build --release \
+ && cp target/release/vocechat-server /vocechat-server
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /vocechat-server /home/vocechat-server/vocechat-server
+COPY config /home/vocechat-server/config
+COPY build/docker/docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh /home/vocechat-server/vocechat-server
+ENV VOCECHAT_FCM_PROJECT_ID="" \
+    VOCECHAT_FCM_PRIVATE_KEY="" \
+    VOCECHAT_FCM_CLIENT_EMAIL="" \
+    VOCECHAT_FCM_TOKEN_URI="https://oauth2.googleapis.com/token"
+EXPOSE 3000
+WORKDIR /home/vocechat-server
+ENTRYPOINT ["/docker-entrypoint.sh"]

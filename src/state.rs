@@ -65,6 +65,7 @@ pub struct CacheGroup {
     pub updated_at: DateTime,
     pub avatar_updated_at: DateTime,
     pub pinned_messages: Vec<PinnedMessage>,
+    pub e2e_enabled: bool,
 }
 
 impl CacheGroup {
@@ -90,6 +91,7 @@ impl CacheGroup {
             is_public: self.ty.is_public(),
             avatar_updated_at: self.avatar_updated_at,
             pinned_messages: self.pinned_messages.clone(),
+            e2e_enabled: self.e2e_enabled,
         }
     }
 }
@@ -584,7 +586,7 @@ impl State {
         let mut groups = BTreeMap::new();
 
         let sql =
-            "select gid, name, description, owner, is_public, created_at, updated_at, avatar_updated_at from `group`";
+            "select gid, name, description, owner, is_public, created_at, updated_at, avatar_updated_at, e2e_enabled from `group`";
         let mut stream = sqlx::query_as::<
             _,
             (
@@ -596,13 +598,27 @@ impl State {
                 DateTime,
                 DateTime,
                 DateTime,
+                bool,
             ),
         >(sql)
         .fetch(db);
         while let Some(res) = stream.next().await {
+            let (
+                gid,
+                name,
+                description,
+                owner,
+                is_public,
+                created_at,
+                updated_at,
+                avatar_updated_at,
+                e2e_enabled,
+            ) = res?;
+
             // load pinned messages
             let sql = "select mid, created_by, created_at from pinned_message where gid = ?";
             let ids = sqlx::query_as::<_, (i64, i64, DateTime)>(sql)
+                .bind(gid)
                 .fetch_all(db)
                 .await?;
             let mut pinned_messages = Vec::new();
@@ -620,16 +636,6 @@ impl State {
 
             pinned_messages.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
-            let (
-                gid,
-                name,
-                description,
-                owner,
-                is_public,
-                created_at,
-                updated_at,
-                avatar_updated_at,
-            ) = res?;
             groups.insert(
                 gid,
                 CacheGroup {
@@ -647,6 +653,7 @@ impl State {
                     updated_at,
                     avatar_updated_at,
                     pinned_messages,
+                    e2e_enabled,
                 },
             );
         }
@@ -1384,11 +1391,16 @@ pub(crate) async fn forward_chat_messages_to_webhook(state: State) {
                     }
                 })
                 .collect::<Vec<_>>();
-            let msg_json = message.to_json_string();
+            let msg_body = if let Some(redacted) = crate::api::redact_e2e_chat_message_json(message)
+            {
+                redacted
+            } else {
+                message.to_json_string()
+            };
 
             for webhook_url in webhook_urls {
                 let client = client.clone();
-                let msg_json = msg_json.clone();
+                let msg_json = msg_body.clone();
 
                 tokio::spawn(async move {
                     for _ in 0..3 {

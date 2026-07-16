@@ -1,0 +1,13 @@
+.git
+**/target
+target
+build/docker/dist
+**/*.pdb
+**/*.exe
+**/*.dll
+**/node_modules
+**/.dart_tool
+**/build/windows
+**/build/app
+*.md
+!build/docker/README.E2E.md

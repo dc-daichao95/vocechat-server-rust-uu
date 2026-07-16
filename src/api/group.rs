@@ -21,8 +21,8 @@ use crate::{
     api::{
         get_merged_message,
         message::{
-            decode_messages, parse_properties_from_base64, send_message, ChatMessageContent,
-            SendMessageRequest,
+            decode_messages, fetch_history_by_time, parse_properties_from_base64, send_message,
+            ChatMessageContent, SendMessageRequest,
         },
         tags::ApiTags,
         token::Token,
@@ -41,6 +41,8 @@ struct UpdateGroupRequest {
     name: Option<String>,
     description: Option<String>,
     owner: Option<i64>,
+    /// Enable end-to-end encryption for new messages in this group
+    e2e_enabled: Option<bool>,
 }
 
 /// Change group type request
@@ -53,7 +55,10 @@ struct ChangeGroupTypeRequest {
 
 impl UpdateGroupRequest {
     fn is_empty(&self) -> bool {
-        self.name.is_none() && self.owner.is_none() && self.description.is_none()
+        self.name.is_none()
+            && self.owner.is_none()
+            && self.description.is_none()
+            && self.e2e_enabled.is_none()
     }
 }
 
@@ -81,6 +86,13 @@ pub struct Group {
     /// Pinned messages
     #[oai(read_only)]
     pub pinned_messages: Vec<PinnedMessage>,
+    /// When true, clients SHOULD send new messages as vocechat/e2e
+    #[oai(default = "default_group_e2e_enabled")]
+    pub e2e_enabled: bool,
+}
+
+fn default_group_e2e_enabled() -> bool {
+    true
 }
 
 /// Pinned message
@@ -168,7 +180,8 @@ impl ApiGroup {
         let mut tx = state.db_pool.begin().await.map_err(InternalServerError)?;
         let now = DateTime::now();
         let owner = if req.is_public { None } else { Some(token.uid) };
-        let sql = "insert into `group` (name, description, owner, is_public, created_at, updated_at) values (?, ?, ?, ?, ?, ?)";
+        let sql = "insert into `group` (name, description, owner, is_public, created_at, updated_at, e2e_enabled) values (?, ?, ?, ?, ?, ?, ?)";
+        let e2e_on = req.0.e2e_enabled;
         let gid = sqlx::query(sql)
             .bind(&req.0.name)
             .bind(req.0.description.as_deref().unwrap_or_default())
@@ -176,6 +189,7 @@ impl ApiGroup {
             .bind(req.is_public)
             .bind(now)
             .bind(now)
+            .bind(e2e_on)
             .execute(&mut tx)
             .await
             .map_err(InternalServerError)?
@@ -208,6 +222,7 @@ impl ApiGroup {
                 updated_at: now,
                 avatar_updated_at: DateTime::zero(),
                 pinned_messages: Vec::new(),
+                e2e_enabled: e2e_on,
             },
         );
 
@@ -220,6 +235,7 @@ impl ApiGroup {
             is_public: req.0.is_public,
             avatar_updated_at: req.0.avatar_updated_at,
             pinned_messages: Vec::new(),
+            e2e_enabled: e2e_on,
         };
 
         // broadcast event
@@ -311,6 +327,7 @@ impl ApiGroup {
                     owner: None,
                     avatar_updated_at: Some(now),
                     is_public: None,
+                    e2e_enabled: None,
                 },
             }));
 
@@ -415,6 +432,7 @@ impl ApiGroup {
                 .map(|_| "name = ?")
                 .chain(req.owner.iter().map(|_| "owner = ?"))
                 .chain(req.description.iter().map(|_| "description = ?"))
+                .chain(req.e2e_enabled.iter().map(|_| "e2e_enabled = ?"))
                 .chain(Some("updated_at = ?"))
                 .join(", ")
         );
@@ -428,6 +446,9 @@ impl ApiGroup {
         }
         if let Some(description) = &req.description {
             query = query.bind(description);
+        }
+        if let Some(e2e_enabled) = &req.e2e_enabled {
+            query = query.bind(e2e_enabled);
         }
 
         query
@@ -444,6 +465,7 @@ impl ApiGroup {
             owner: None,
             avatar_updated_at: None,
             is_public: None,
+            e2e_enabled: None,
         };
 
         // update cache
@@ -460,6 +482,10 @@ impl ApiGroup {
                 broadcast_event.owner = Some(new_owner);
                 *owner = new_owner;
             }
+        }
+        if let Some(e2e_enabled) = req.0.e2e_enabled {
+            broadcast_event.e2e_enabled = Some(e2e_enabled);
+            group.e2e_enabled = e2e_enabled;
         }
 
         // broadcast event
@@ -579,6 +605,7 @@ impl ApiGroup {
                             owner: Some(gid.0),
                             avatar_updated_at: None,
                             is_public: Some(false),
+                            e2e_enabled: None,
                         },
                     }));
             }
@@ -607,6 +634,7 @@ impl ApiGroup {
                             owner: None,
                             avatar_updated_at: None,
                             is_public: Some(true),
+                            e2e_enabled: None,
                         },
                     }));
 
@@ -918,6 +946,8 @@ impl ApiGroup {
     }
 
     /// Get history messages
+    ///
+    /// Optional `after_ts` / `before_ts` (unix ms) for jump-to-date and range load.
     #[oai(path = "/:gid/history", method = "get")]
     async fn get_history_messages(
         &self,
@@ -925,6 +955,8 @@ impl ApiGroup {
         token: Token,
         gid: Path<i64>,
         before: Query<Option<i64>>,
+        after_ts: Query<Option<i64>>,
+        before_ts: Query<Option<i64>>,
         #[oai(default = "default_get_history_messages_limit")] limit: Query<usize>,
     ) -> Result<Json<Vec<ChatMessage>>> {
         let cache = state.cache.read().await;
@@ -937,12 +969,21 @@ impl ApiGroup {
             return Err(Error::from_status(StatusCode::FORBIDDEN));
         }
 
-        let msgs = state
-            .msg_db
-            .messages()
-            .fetch_group_messages_before(gid.0, before.0, limit.0)
-            .map_err(InternalServerError)?;
-        Ok(Json(decode_messages(msgs)))
+        let gid = gid.0;
+        let msg_db = state.msg_db.clone();
+        let msgs = fetch_history_by_time(
+            |cursor, lim| {
+                msg_db
+                    .messages()
+                    .fetch_group_messages_before(gid, cursor, lim)
+                    .map_err(InternalServerError)
+            },
+            before.0,
+            after_ts.0,
+            before_ts.0,
+            limit.0.min(500),
+        )?;
+        Ok(Json(msgs))
     }
 
     /// Generates a Agora token

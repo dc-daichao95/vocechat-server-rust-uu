@@ -1,0 +1,18 @@
+# Prebuilt Linux binary packaging (no rustc in image).
+# 1) Produce Linux binary: bash build/docker/build-linux-wsl.sh
+# 2) docker build -f build/docker/Dockerfile.prebuilt -t vocechat-server:latest .
+#
+# Prefer Dockerfile.linux (multi-stage) when Docker Hub/rust builds are available.
+# Runtime is Debian so the staged glibc binary from WSL works.
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY build/docker/dist/vocechat-server /home/vocechat-server/vocechat-server
+COPY config /home/vocechat-server/config
+COPY build/docker/docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh /home/vocechat-server/vocechat-server
+EXPOSE 3000
+WORKDIR /home/vocechat-server
+ENTRYPOINT ["/docker-entrypoint.sh"]
