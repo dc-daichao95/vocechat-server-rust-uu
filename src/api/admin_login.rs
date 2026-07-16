@@ -11,7 +11,7 @@ use crate::{
 
 pub struct ApiAdminLogin;
 
-#[derive(Debug, Object, Serialize, Deserialize)]
+#[derive(Debug, Object, Serialize, Deserialize, Clone)]
 pub struct OIDCConfig {
     pub enable: bool,
     pub favicon: String,
@@ -25,7 +25,7 @@ pub enum WhoCanSignUp {
 }
 
 /// Login config
-#[derive(Debug, Object, Serialize, Deserialize)]
+#[derive(Debug, Object, Serialize, Deserialize, Clone)]
 pub struct LoginConfig {
     /// Who can sign up
     #[serde(default = "default_who_can_sign_up")]

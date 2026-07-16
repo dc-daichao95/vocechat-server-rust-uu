@@ -9,7 +9,7 @@ Assumption: **1 full-time engineer**; Windows = VS2022 + Rust 1.97 MSVC + Flutte
 |-------|--------|--------|
 | **A** Badge | **Done** | Client `0.2.141+111` |
 | **B** `voce-e2ee-core` | **Done** | Tests 7/7; DLL FFI smoke; WASM `pkg/`; license audit |
-| **C** Server v2 enforcement | **~40%** | v1 APIs + `e2e_protocol_ver`; **new** `E2E_UPGRADE_REQUIRED` when ver≥2; device-link still missing |
+| **C** Server v2 enforcement | **~85%** | protocol API, SPK required at ver≥2, upgrade reject, device-link; admin cutover UX optional |
 | **D1** Web DM v2 | **0%** | Still `E2E_VER = 1` |
 | **D2** Flutter DM v2 | **0%** | Still Dart v1; DLL ready to link |
 | **D3** Channel SK + files v2 | **0%** | |
@@ -21,7 +21,7 @@ Assumption: **1 full-time engineer**; Windows = VS2022 + Rust 1.97 MSVC + Flutte
 | Workstream | Optimistic | Likely | Pessimistic |
 |------------|------------|--------|-------------|
 | **B leftover** (none) | 0 | **0** | 0 |
-| **C finish** (device-link, identity sig required, admin cutover docs) | 1d | **2d** | 3d |
+| **C finish** (admin cutover docs polish) | 0.25d | **0.5d** | 1d |
 | **D1** Web WASM/FFI bind + DM v2 + v1 read-only | 2.5d | **4d** | 6d |
 | **D2** Flutter FFI + DM v2 + secure key store | 2d | **3.5d** | 5d |
 | **D3** Channel SK + encrypted file meta | 2d | **4d** | 6d |
