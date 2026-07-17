@@ -1,0 +1,27 @@
+# Optional REALITY edge in front of the E2E stack.
+# Usage:
+#   cp ../../deploy/sing-box-reality/config.json.example ../../deploy/sing-box-reality/config.json
+#   # edit keys / uuid / server_names
+#   docker compose -f build/docker/docker-compose.e2e.yml -f build/docker/docker-compose.reality.yml up -d --build
+#
+# Exposes REALITY on host :443; nginx HTTP ports can stay internal or unbound.
+
+services:
+  sing-box:
+    image: ghcr.io/sagernet/sing-box:1.10.7
+    container_name: vocechat-sing-box-reality
+    depends_on:
+      - vocechat
+    ports:
+      - "${REALITY_PORT:-443}:443"
+    volumes:
+      - ../../deploy/sing-box-reality/config.json:/etc/sing-box/config.json:ro
+    command: ["-c", "/etc/sing-box/config.json", "run"]
+    networks:
+      - vocechat-net
+    restart: unless-stopped
+
+  # Prefer REALITY as the only public entry — do not publish nginx to the host
+  # when this override is used (operators may still keep nginx for ACME helpers).
+  nginx:
+    ports: !reset []

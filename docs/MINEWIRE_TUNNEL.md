@@ -25,6 +25,8 @@
 
 上游明确：**爱好实验**，不声称对抗行为/流量分析 DPI。勿在高风险环境当作唯一通道。
 
+同类可选边缘：[`sing-box REALITY`](../deploy/sing-box-reality/)（TLS 指纹伪装，见 [`SECURITY_E2E_AND_OBFUSCATION.md`](SECURITY_E2E_AND_OBFUSCATION.md) §2）。
+
 ## 2. 架构
 
 ```

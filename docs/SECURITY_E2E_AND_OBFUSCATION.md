@@ -39,7 +39,9 @@
 
 原因：REALITY/伪装是**传输层/代理栈**能力；本进程是标准 HTTPS（或 HTTP）上的聊天 API。把 REALITY 塞进 Poem 会破坏证书、ACME、浏览器直连与 OpenAPI 客户端兼容。
 
-**可选旁路（应用外）：** 可用 [Minewire](https://github.com/dmitrymodder/minewire) 作为 sidecar。运维模板与验证说明见 [`MINEWIRE_TUNNEL.md`](MINEWIRE_TUNNEL.md) 与 [`../deploy/minewire/`](../deploy/minewire/)。
+**可选旁路（应用外）：**
+- [sing-box REALITY](../deploy/sing-box-reality/) — TLS 指纹伪装边缘（推荐与 E2E compose 叠加：`build/docker/docker-compose.reality.yml`）
+- [Minewire](https://github.com/dmitrymodder/minewire) — Minecraft 伪装隧道 sidecar。运维模板见 [`MINEWIRE_TUNNEL.md`](MINEWIRE_TUNNEL.md) 与 [`../deploy/minewire/`](../deploy/minewire/)
 
 ### 2.2 推荐部署拓扑（运维，非本仓代码交付）
 
@@ -69,12 +71,23 @@
 ### 2.4 Server 仓文档义务（可做）
 
 - 在 README/本文件说明「抗封锁靠边缘代理，不靠本进程」。  
-- 可选：`docs/deploy/` 后续补充示例 `docker-compose`（server + 反代），**不含**违法用途指引；配置为占位模板。  
+- 已交付：[`../deploy/sing-box-reality/`](../deploy/sing-box-reality/) + [`../build/docker/docker-compose.reality.yml`](../build/docker/docker-compose.reality.yml)（占位密钥，勿提交真实密钥）。  
 - MUST NOT 在发行说明中宣称「已内置 REALITY / 已伪装成 Google」。
 
 ### 2.5 与 E2E 的组合
 
 即使用户走 REALITY，边缘代理或公司 MITM 仍可能看到**到达 VoceChat 源站之后**的 TLS；若再拆源站 TLS，**只有 E2E 保护正文**。部署上两者都应启用才覆盖威胁 D。
+
+### 2.6 应用层元数据硬化（客户端，非 Server 解密）
+
+设计：[`superpowers/specs/2026-07-17-metadata-and-anti-blocking-design.md`](superpowers/specs/2026-07-17-metadata-and-anti-blocking-design.md)
+
+| 控制 | 说明 |
+| --- | --- |
+| 长度分桶填充 | 明文先 `pad_message`（`u32_be \|\| {"m","c"} \|\| random` → 2^n 桶），再 AEAD；削弱「按密文长度猜消息长度」 |
+| 属性最小化 | 线属性仅保留 `e2e` / `e2e_ver` / `sender_device_id` / `local_id`（及必要 `gid`/`cid`）；MIME 进填充载荷，不再发 `inner_content_type` / `peer_device_ids` |
+
+Server 仍可见会话图与时序；上述只降低**消息属性与长度泄漏**，不隐藏社交图。
 
 ---
 
@@ -189,3 +202,4 @@ E2E PR **不得**与 REALITY 客户端、无关依赖大升级混在同一变更
 | 2026-07-13 | 验证：`cargo build --release` PASS；Android debug/release APK PASS；Windows Flutter 因缺 VS C++ CMake 工具链 BLOCKED；频道/Flutter E2E 仍未实现 |
 | 2026-07-14 | 验证：安装 VS NativeDesktop 后 Windows release PASS（`vocechat_client.exe`）；E2E identity 单测 PASS |
 | 2026-07-14 | 全量切片：Web 频道 Sender Keys + 文件信封；Flutter DM/频道文本 e2e_ver=1；Docker Compose+nginx 部署文档（`build/docker/docker-compose.e2e.yml`）。混淆仍为边缘可选，非本镜像 |
+| 2026-07-17 | 元数据应用层（pad + 属性最小化）+ `deploy/sing-box-reality` / `docker-compose.reality.yml` |

@@ -5,7 +5,9 @@
 - **Linux amd64** `vocechat-server` binary built inside Docker (`Dockerfile.linux`)
 - **nginx** reverse proxy for HTTP (optional TLS via mounted certs)
 - Application **E2E** is in Server API + clients; nginx does **not** decrypt messages
-- **Network obfuscation** (REALITY etc.) stays **outside** this stack — put Xray/sing-box in front if needed
+- **Network obfuscation** (REALITY etc.) stays **outside** this stack — optional pack:
+  - [`deploy/sing-box-reality/`](../../deploy/sing-box-reality/)
+  - overlay: `docker compose -f build/docker/docker-compose.e2e.yml -f build/docker/docker-compose.reality.yml up -d`
 
 ## Quick start
 

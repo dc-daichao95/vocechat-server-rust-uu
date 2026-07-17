@@ -1,0 +1,14 @@
+services:
+  sing-box:
+    image: ghcr.io/sagernet/sing-box:1.10.7
+    container_name: vocechat-sing-box-reality
+    restart: unless-stopped
+    ports:
+      - "${REALITY_PORT:-443}:443"
+    volumes:
+      - ./config.json:/etc/sing-box/config.json:ro
+    command: ["-c", "/etc/sing-box/config.json", "run"]
+    # When used alone, point config outbound server to host.docker.internal:3000
+    # or join the vocechat-net from docker-compose.reality.yml.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

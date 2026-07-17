@@ -1,0 +1,35 @@
+{
+  "log": { "level": "warn" },
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "reality-out",
+      "server": "REPLACE_PUBLIC_HOST",
+      "server_port": 443,
+      "uuid": "REPLACE_WITH_UUID",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.microsoft.com",
+        "utls": { "enabled": true, "fingerprint": "chrome" },
+        "reality": {
+          "enabled": true,
+          "public_key": "REPLACE_WITH_REALITY_PUBLIC_KEY",
+          "short_id": "REPLACE_SHORT_ID_HEX_8"
+        }
+      }
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890
+    }
+  ],
+  "route": {
+    "final": "reality-out"
+  }
+}

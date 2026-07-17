@@ -1,0 +1,51 @@
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "reality-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        {
+          "uuid": "REPLACE_WITH_UUID",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.microsoft.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.microsoft.com",
+            "server_port": 443
+          },
+          "private_key": "REPLACE_WITH_REALITY_PRIVATE_KEY",
+          "short_id": ["REPLACE_SHORT_ID_HEX_8"]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "http",
+      "tag": "vocechat",
+      "server": "vocechat",
+      "server_port": 3000
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": ["reality-in"],
+        "outbound": "vocechat"
+      }
+    ],
+    "final": "direct"
+  }
+}
