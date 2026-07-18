@@ -1,9 +1,4 @@
-use poem::{
-    error::InternalServerError,
-    http::StatusCode,
-    web::Data,
-    Error, Result,
-};
+use poem::{error::InternalServerError, http::StatusCode, web::Data, Error, Result};
 use poem_openapi::{
     param::{Path, Query},
     payload::Json,
@@ -388,9 +383,8 @@ impl ApiE2e {
         token: Token,
         req: Json<PutE2eBackupRequest>,
     ) -> Result<()> {
-        let raw = base64::decode(req.blob_base64.trim()).map_err(|_| {
-            Error::from_status(StatusCode::BAD_REQUEST)
-        })?;
+        let raw = base64::decode(req.blob_base64.trim())
+            .map_err(|_| Error::from_status(StatusCode::BAD_REQUEST))?;
         if raw.is_empty() || raw.len() > 2 * 1024 * 1024 {
             return Err(Error::from_status(StatusCode::BAD_REQUEST));
         }
@@ -565,7 +559,7 @@ impl ApiE2e {
         if row.0 != token.uid {
             return Err(Error::from_status(StatusCode::FORBIDDEN));
         }
-        if row.2.is_some() || row.1.0 <= now.0 {
+        if row.2.is_some() || row.1 .0 <= now.0 {
             return Err(Error::from_string(
                 "E2E_DEVICE_LINK_EXPIRED",
                 StatusCode::GONE,
@@ -617,9 +611,8 @@ impl ApiE2e {
                 StatusCode::GONE,
             ));
         }
-        let package = package.ok_or_else(|| {
-            Error::from_string("E2E_DEVICE_LINK_PENDING", StatusCode::CONFLICT)
-        })?;
+        let package = package
+            .ok_or_else(|| Error::from_string("E2E_DEVICE_LINK_PENDING", StatusCode::CONFLICT))?;
 
         sqlx::query("update e2e_device_link set consumed_at = ?, package_blob = null where id = ?")
             .bind(now)
@@ -659,7 +652,7 @@ impl ApiE2e {
         let has_package = row.1.is_some();
         let status = if row.3.is_some() {
             "consumed"
-        } else if row.2.0 <= now.0 {
+        } else if row.2 .0 <= now.0 {
             "expired"
         } else if has_package {
             "ready"
@@ -732,8 +725,8 @@ mod tests {
             .body_json(&json!({
                 "device_id": "web:test",
                 "identity_key_pub": "pk_test_abc",
-                "signed_prekey_pub": null,
-                "signed_prekey_sig": null
+                "signed_prekey_pub": "spk_test_abc",
+                "signed_prekey_sig": "sig_test_abc"
             }))
             .send()
             .await;
@@ -768,7 +761,7 @@ mod tests {
             .await;
         resp.assert_status_is_ok();
         let body = resp.json().await;
-        assert_eq!(body.value().object().get("e2e_protocol_ver").i64(), 1);
+        assert_eq!(body.value().object().get("e2e_protocol_ver").i64(), 2);
 
         let resp = server
             .post("/api/user/e2e/device-link/start")

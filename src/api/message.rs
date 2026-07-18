@@ -20,8 +20,8 @@ use serde_json::Value;
 
 use crate::{
     api::{
-        group::Group, resource::FileMeta, user::UserInfo, DateTime, FcmConfig, LangId,
-        LoginConfig, PinnedMessage, UpdateAction,
+        group::Group, resource::FileMeta, user::UserInfo, DateTime, FcmConfig, LangId, LoginConfig,
+        PinnedMessage, UpdateAction,
     },
     state::{BroadcastEvent, Cache, UserStatus},
     State,
@@ -668,9 +668,7 @@ pub fn message_matches_query(msg: &ChatMessage, query: &str) -> bool {
         MessageDetail::Reaction(_) => None,
     };
     match content {
-        Some(c)
-            if c.content_type == "text/plain" || c.content_type == "text/markdown" =>
-        {
+        Some(c) if c.content_type == "text/plain" || c.content_type == "text/markdown" => {
             c.content.to_lowercase().contains(query)
         }
         _ => false,
@@ -912,7 +910,7 @@ async fn enforce_e2e_required(state: &State, payload: &ChatMessagePayload) -> po
     Ok(())
 }
 
-/// When server `e2e_protocol_ver` is 2+, reject encrypted sends with `e2e_ver` < required.
+/// Generation 2 uses only the opaque MLS delivery API. Legacy JSON envelopes are rejected.
 async fn enforce_e2e_protocol_ver(state: &State, payload: &ChatMessagePayload) -> poem::Result<()> {
     let required = state
         .get_dynamic_config_instance::<LoginConfig>()
@@ -938,19 +936,10 @@ async fn enforce_e2e_protocol_ver(state: &State, payload: &ChatMessagePayload) -
         return Ok(());
     }
 
-    let ver = content
-        .properties
-        .as_ref()
-        .and_then(|p| p.get("e2e_ver"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(1);
-    if ver < required as i64 {
-        return Err(Error::from_string(
-            "E2E_UPGRADE_REQUIRED",
-            StatusCode::FORBIDDEN,
-        ));
-    }
-    Ok(())
+    Err(Error::from_string(
+        "E2E_UPGRADE_REQUIRED",
+        StatusCode::FORBIDDEN,
+    ))
 }
 
 pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poem::Result<i64> {

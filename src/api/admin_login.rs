@@ -57,11 +57,11 @@ pub struct LoginConfig {
     /// Server advertises E2E capability to clients
     #[serde(default = "default_e2e_available")]
     pub e2e_available: bool,
-    /// When true, new DMs/channels encrypt by default (e2e_ver=1)
+    /// When true, new DMs/channels encrypt by default.
     #[serde(default = "default_e2e_default_on")]
     pub e2e_default_on: bool,
     /// Wire protocol version clients must implement for E2E
-    /// (`1` = v1 MK/P-256; `2` = v2 X3DH+ratchet — old clients get `E2E_UPGRADE_REQUIRED`)
+    /// This distribution requires generation 2.
     #[serde(default = "default_e2e_protocol_ver")]
     pub e2e_protocol_ver: i32,
 }
@@ -79,7 +79,7 @@ const fn default_e2e_default_on() -> bool {
 }
 
 const fn default_e2e_protocol_ver() -> i32 {
-    1
+    2
 }
 
 impl Default for LoginConfig {
@@ -96,7 +96,7 @@ impl Default for LoginConfig {
             third_party: false,
             e2e_available: true,
             e2e_default_on: true,
-            e2e_protocol_ver: 1,
+            e2e_protocol_ver: 2,
         }
     }
 }

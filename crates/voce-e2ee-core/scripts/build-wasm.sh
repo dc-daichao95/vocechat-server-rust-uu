@@ -1,17 +1,25 @@
-#!/usr/bin/env bash
-# Build voce-e2ee-core for the browser (cargo + wasm-bindgen).
-set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-CRATE="$(cd "$(dirname "$0")/.." && pwd)"
-PKG="$CRATE/pkg"
+#!/usr/bin/env sh
+set -eu
 
-rustup target add wasm32-unknown-unknown >/dev/null
-command -v wasm-bindgen >/dev/null || cargo install wasm-bindgen-cli --locked
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+CRATE_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+OUTPUT_DIR=${MLS_WASM_OUTPUT:-"$CRATE_DIR/pkg"}
+if [ -n "${WASM_BINDGEN:-}" ]; then
+  BINDGEN=$WASM_BINDGEN
+elif command -v wasm-bindgen >/dev/null 2>&1; then
+  BINDGEN=$(command -v wasm-bindgen)
+else
+  printf '%s\n' 'wasm-bindgen-cli is required to emit JS bindings' >&2
+  exit 2
+fi
 
-cd "$ROOT"
-cargo build -p voce-e2ee-core --target wasm32-unknown-unknown --features wasm --release
-mkdir -p "$PKG"
-wasm-bindgen "$ROOT/target/wasm32-unknown-unknown/release/voce_e2ee_core.wasm" \
-  --out-dir "$PKG" --target web --typescript
-echo "WASM package written to $PKG"
-ls -la "$PKG"
+cargo build --manifest-path "$CRATE_DIR/Cargo.toml" \
+  --release \
+  --target wasm32-unknown-unknown \
+  --features wasm
+mkdir -p "$OUTPUT_DIR"
+"$BINDGEN" \
+  --target web \
+  --out-dir "$OUTPUT_DIR" \
+  --out-name voce_e2ee_core \
+  "$CRATE_DIR/../../target/wasm32-unknown-unknown/release/voce_e2ee_core.wasm"

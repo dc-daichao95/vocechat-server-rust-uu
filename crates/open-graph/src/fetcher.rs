@@ -147,7 +147,7 @@ fn walk(handle: Handle, url: &str) -> Result<Object, Error> {
                     if obj.images.is_empty() {
                         obj.images.push(Image::new(value.clone()));
                     }
-                    let mut v = obj.images.last_mut().unwrap();
+                    let v = obj.images.last_mut().unwrap();
                     match key1.as_ref() {
                         "width" => v.width = value.parse::<i32>().ok(),
                         "height" => v.height = value.parse::<i32>().ok(),
@@ -165,7 +165,7 @@ fn walk(handle: Handle, url: &str) -> Result<Object, Error> {
                     if obj.audios.is_empty() {
                         obj.audios.push(Audio::new(value.clone()));
                     }
-                    let mut v = obj.audios.last_mut().unwrap();
+                    let v = obj.audios.last_mut().unwrap();
                     match key1.as_ref() {
                         "secure_url" => v.secure_url = Some(value),
                         "type" => v.r#type = Some(value),
@@ -180,7 +180,7 @@ fn walk(handle: Handle, url: &str) -> Result<Object, Error> {
                     if obj.videos.is_empty() {
                         obj.videos.push(Video::new(value.clone()));
                     }
-                    let mut v = obj.videos.last_mut().unwrap();
+                    let v = obj.videos.last_mut().unwrap();
                     match key1.as_ref() {
                         "height" => v.height = value.parse::<i32>().ok(),
                         "width" => v.width = value.parse::<i32>().ok(),

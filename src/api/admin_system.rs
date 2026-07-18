@@ -6,6 +6,7 @@ use poem_openapi::{
     ApiRequest, Object, OpenApi,
 };
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::{
     api::{tags::ApiTags, token::Token, SmtpConfig, UserInfo},
@@ -240,6 +241,29 @@ struct CreateAdminRequest {
     gender: i32,
 }
 
+#[derive(Debug, Object, Serialize, Deserialize)]
+struct ReleaseInfo {
+    version: String,
+    notes: String,
+    #[oai(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Object, Serialize, Deserialize)]
+struct ReleaseList {
+    releases: Vec<ReleaseInfo>,
+}
+
+#[derive(Debug, Object, Serialize, Deserialize)]
+struct ApplyReleaseRequest {
+    version: String,
+}
+
+#[derive(Debug, Object, Serialize, Deserialize)]
+struct ApplyReleaseResult {
+    accepted: String,
+}
+
 pub struct ApiAdminSystem;
 
 #[OpenApi(prefix_path = "/admin/system", tag = "ApiTags::AdminSystem")]
@@ -248,6 +272,38 @@ impl ApiAdminSystem {
     #[oai(path = "/version", method = "get")]
     async fn version(&self) -> PlainText<&'static str> {
         PlainText(env!("CARGO_PKG_VERSION"))
+    }
+
+    /// List locally mounted, signed release bundles.
+    #[oai(path = "/releases", method = "get")]
+    async fn releases(&self, token: Token) -> Result<Json<ReleaseList>> {
+        require_admin(&token)?;
+        Ok(Json(
+            updater_request(reqwest::Method::GET, "/v1/releases", None).await?,
+        ))
+    }
+
+    /// Verify and roll out a signed Server + Web release through the host updater.
+    #[oai(path = "/releases/apply", method = "post")]
+    async fn apply_release(
+        &self,
+        token: Token,
+        req: Json<ApplyReleaseRequest>,
+    ) -> Result<Json<ApplyReleaseResult>> {
+        require_admin(&token)?;
+        if req.version.is_empty()
+            || req.version.len() > 64
+            || !req
+                .version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        {
+            return Err(Error::from_status(StatusCode::BAD_REQUEST));
+        }
+        let body = serde_json::to_vec(&req.0).map_err(InternalServerError)?;
+        Ok(Json(
+            updater_request(reqwest::Method::POST, "/v1/apply", Some(body)).await?,
+        ))
     }
 
     /// Create administrator user
@@ -508,6 +564,61 @@ impl ApiAdminSystem {
             .await?;
         Ok(())
     }
+}
+
+fn require_admin(token: &Token) -> Result<()> {
+    if token.is_admin {
+        Ok(())
+    } else {
+        Err(Error::from_status(StatusCode::FORBIDDEN))
+    }
+}
+
+async fn updater_request<T>(method: reqwest::Method, path: &str, body: Option<Vec<u8>>) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let base = std::env::var("VOCECHAT_UPDATER_URL")
+        .unwrap_or_else(|_| "http://vocechat-updater:8787".to_string());
+    let token = match std::env::var("VOCECHAT_UPDATER_TOKEN_FILE") {
+        Ok(path) => std::fs::read_to_string(path)
+            .map(|value| value.trim().to_string())
+            .map_err(|_| Error::from_status(StatusCode::SERVICE_UNAVAILABLE))?,
+        Err(_) => std::env::var("VOCECHAT_UPDATER_TOKEN")
+            .map_err(|_| Error::from_status(StatusCode::SERVICE_UNAVAILABLE))?,
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(InternalServerError)?;
+    let mut request = client
+        .request(method, format!("{}{}", base.trim_end_matches('/'), path))
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+    }
+    let response = request.send().await.map_err(|error| {
+        Error::from_string(
+            format!("release updater unavailable: {error}"),
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    })?;
+    if !response.status().is_success() {
+        let status = if response.status() == reqwest::StatusCode::BAD_REQUEST {
+            StatusCode::BAD_REQUEST
+        } else if response.status() == reqwest::StatusCode::CONFLICT {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        return Err(Error::from_string(
+            "release updater rejected request",
+            status,
+        ));
+    }
+    response.json().await.map_err(InternalServerError)
 }
 
 #[test]

@@ -60,6 +60,12 @@ pub fn dispatch(method: &str, args: &Value) -> String {
         "dm_session_open_responder" => dm_session_open_responder(args),
         "pad_message" => pad_message_ffi(args),
         "unpad_message" => unpad_message_ffi(args),
+        method if method.starts_with("mls_") => {
+            match crate::mls::commands::dispatch(method, args) {
+                Ok(value) => ok(value),
+                Err(error) => err(error),
+            }
+        }
         _ => err(format!("unknown method: {method}")),
     }
 }
@@ -359,13 +365,18 @@ fn decode32(args: &Value, key: &str) -> Result<[u8; 32], String> {
 }
 
 fn to_c_string(s: String) -> *mut c_char {
-    CString::new(s).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(s)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// # Safety
 /// `method` and `json_args` must be valid NUL-terminated UTF-8 C strings (or null → empty).
 #[no_mangle]
-pub unsafe extern "C" fn voce_e2ee_call(method: *const c_char, json_args: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn voce_e2ee_call(
+    method: *const c_char,
+    json_args: *const c_char,
+) -> *mut c_char {
     let method = if method.is_null() {
         ""
     } else {

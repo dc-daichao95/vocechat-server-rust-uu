@@ -86,7 +86,7 @@ impl TestServer {
                     third_party: true,
                     e2e_available: true,
                     e2e_default_on: true,
-                    e2e_protocol_ver: 1,
+                    e2e_protocol_ver: 2,
                 },
             })
             .await

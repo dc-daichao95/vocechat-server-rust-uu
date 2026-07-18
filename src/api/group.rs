@@ -21,8 +21,8 @@ use crate::{
     api::{
         get_merged_message,
         message::{
-            decode_messages, fetch_history_by_time, parse_properties_from_base64, send_message,
-            ChatMessageContent, SendMessageRequest,
+            fetch_history_by_time, parse_properties_from_base64, send_message, ChatMessageContent,
+            SendMessageRequest,
         },
         tags::ApiTags,
         token::Token,

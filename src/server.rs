@@ -138,6 +138,12 @@ pub async fn create_state(config_path: &Path, config: Arc<Config>) -> Result<Sta
         .await?;
     state.initialize_dynamic_config::<AgoraConfig>().await?;
     state.initialize_dynamic_config::<LoginConfig>().await?;
+    let mut login = state.load_dynamic_config::<LoginConfig>().await?;
+    login.enabled = true;
+    login.config.e2e_available = true;
+    login.config.e2e_default_on = true;
+    login.config.e2e_protocol_ver = 2;
+    state.set_dynamic_config(login).await?;
 
     // create users
     for user in &config.users {

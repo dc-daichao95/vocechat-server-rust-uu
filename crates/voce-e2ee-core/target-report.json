@@ -1,0 +1,13 @@
+{
+  "generated_at": "2026-07-18T01:38:03Z",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "ciphersuite": "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+  "targets": {
+    "wasm32-unknown-unknown": "pass",
+    "x86_64-pc-windows-gnu": "pass",
+    "aarch64-linux-android": "pass",
+    "x86_64-linux-android": "pass",
+    "aarch64-apple-ios": "pass",
+    "aarch64-apple-ios-sim": "pass"
+  }
+}

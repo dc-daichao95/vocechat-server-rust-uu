@@ -18,6 +18,7 @@ mod langid;
 mod license;
 mod message;
 mod message_api;
+mod mls;
 mod resource;
 mod tags;
 mod token;
@@ -64,6 +65,7 @@ pub fn create_api_service() -> OpenApiService<impl OpenApi, ()> {
                 resource::ApiResource,
                 message_api::ApiMessage,
                 favorite::ApiFavorite,
+                mls::ApiMls,
             ),
             (
                 license::ApiLicense,

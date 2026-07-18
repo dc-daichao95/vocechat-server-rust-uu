@@ -493,7 +493,7 @@ pub async fn sha256_file<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<S
         let mut file = std::fs::File::open(path)?;
         let mut sha256 = sha2::Sha256::new();
         std::io::copy(&mut file, &mut sha256)?;
-        let hash = hex::encode(sha256.finalize().as_slice());
+        let hash = hex::encode(sha256.finalize());
         Ok::<_, std::io::Error>(hash)
     })
     .await??)
@@ -527,7 +527,7 @@ mod tests {
     fn sha256_bytes(v: impl AsRef<[u8]>) -> String {
         let mut sha256 = sha2::Sha256::new();
         sha2::digest::Update::update(&mut sha256, v);
-        hex::encode(sha256.finalize().as_slice())
+        hex::encode(sha256.finalize())
     }
 
     #[test]

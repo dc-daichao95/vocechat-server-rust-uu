@@ -7,6 +7,7 @@ mod config;
 mod create_user;
 mod license;
 mod middleware;
+mod mls_delivery;
 mod self_signed;
 mod server;
 mod state;
@@ -290,7 +291,8 @@ fn main() {
                 .https(server::create_endpoint(state.clone()).await)
                 .http(auto_cert.as_ref().unwrap().http_01_endpoint())
                 .boxed(),
-            _ => server::create_endpoint(state.clone()).await
+            _ => server::create_endpoint(state.clone())
+                .await
                 .map_to_response()
                 .boxed(),
         };

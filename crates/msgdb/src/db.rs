@@ -26,7 +26,7 @@ impl MsgDb {
     }
 
     #[inline]
-    pub fn messages(&self) -> Messages {
+    pub fn messages(&self) -> Messages<'_> {
         Messages { db: self }
     }
 

@@ -11,6 +11,7 @@ pub mod error;
 pub mod ffi;
 pub mod identity;
 pub mod kdf;
+pub mod mls;
 pub mod pad;
 pub mod ratchet;
 pub mod sender_keys;
