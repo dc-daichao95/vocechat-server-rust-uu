@@ -7,7 +7,7 @@
 #
 # Prefer Debian slim so a normal glibc release binary works (no musl required).
 
-FROM rust:1.78-bookworm AS builder
+FROM rust:1.95.0-bookworm AS builder
 WORKDIR /src
 COPY . .
 RUN cargo build --release \
