@@ -93,3 +93,47 @@ fn malformed_or_oversized_command_input_is_rejected() {
     .unwrap();
     assert_eq!(oversized["ok"], false);
 }
+
+#[test]
+fn mls_group_epoch_is_exposed_for_authenticated_routing_metadata() {
+    let alice = call(
+        "mls_device_generate",
+        json!({"identity_b64": B64.encode(b"alice-epoch")}),
+    );
+    let group = call(
+        "mls_group_create",
+        json!({
+            "device_state_b64": alice["device_state_b64"],
+            "group_id_b64": B64.encode(b"epoch-route"),
+        }),
+    );
+    let info = call(
+        "mls_group_info",
+        json!({"group_state_b64": group["group_state_b64"]}),
+    );
+    assert_eq!(info["epoch"], 0);
+}
+
+#[test]
+fn attachment_descriptor_crosses_the_shared_command_boundary() {
+    let encoded = call(
+        "e2ee_attachment_encode",
+        json!({
+            "path": "opaque/file.bin",
+            "key_b64": B64.encode([1_u8; 32]),
+            "nonce_b64": B64.encode([2_u8; 12]),
+            "sha256_b64": B64.encode([3_u8; 32]),
+            "mime": "application/octet-stream",
+            "name": "file.bin",
+            "size": 42,
+        }),
+    );
+    let decoded = call(
+        "e2ee_attachment_decode",
+        json!({"descriptor_b64": encoded["descriptor_b64"]}),
+    );
+    assert_eq!(decoded["path"], "opaque/file.bin");
+    assert_eq!(decoded["name"], "file.bin");
+    assert_eq!(decoded["size"], 42);
+    assert_eq!(decoded["key_b64"], B64.encode([1_u8; 32]));
+}

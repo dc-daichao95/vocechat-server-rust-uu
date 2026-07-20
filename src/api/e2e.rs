@@ -6,7 +6,6 @@ use poem_openapi::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 use crate::{
     api::{tags::ApiTags, token::Token, DateTime, LoginConfig},
@@ -74,12 +73,17 @@ struct E2ePrekeyBundle {
 
 #[derive(Debug, Object)]
 struct PutE2eBackupRequest {
+    /// Encrypted backup container version. Generation-2 clients use version 2.
+    version: i32,
     /// Opaque passphrase-encrypted blob (base64)
     blob_base64: String,
 }
 
 #[derive(Debug, Object)]
 struct E2eBackupResponse {
+    version: i32,
+    size_bytes: i64,
+    updated_by_device: String,
     blob_base64: String,
     updated_at: DateTime,
 }
@@ -105,39 +109,6 @@ struct E2eProtocolInfo {
     e2e_protocol_ver: i32,
 }
 
-#[derive(Debug, Object)]
-struct DeviceLinkStartResponse {
-    link_id: i64,
-    /// Opaque pairing token (embed in QR). Treat as secret.
-    token: String,
-    expires_at: DateTime,
-}
-
-#[derive(Debug, Object)]
-struct PutDeviceLinkPackageRequest {
-    /// Passphrase- or device-key-encrypted identity package (base64). Server stores opaque bytes.
-    package_base64: String,
-}
-
-#[derive(Debug, Object)]
-struct DeviceLinkCompleteRequest {
-    token: String,
-}
-
-#[derive(Debug, Object)]
-struct DeviceLinkCompleteResponse {
-    uid: i64,
-    package_base64: String,
-}
-
-#[derive(Debug, Object)]
-struct DeviceLinkStatus {
-    link_id: i64,
-    status: String,
-    expires_at: DateTime,
-    has_package: bool,
-}
-
 pub struct ApiE2e;
 
 #[OpenApi(prefix_path = "/user/e2e", tag = "ApiTags::User")]
@@ -150,6 +121,8 @@ impl ApiE2e {
         token: Token,
         req: Json<PutE2eIdentityRequest>,
     ) -> Result<Json<E2eIdentity>> {
+        crate::e2ee_v2::validate_authenticated_device(&req.device_id, &token.device)
+            .map_err(|error| Error::from_string(error.to_string(), StatusCode::BAD_REQUEST))?;
         if req.device_id.is_empty() || req.identity_key_pub.is_empty() {
             return Err(Error::from_status(StatusCode::BAD_REQUEST));
         }
@@ -271,6 +244,8 @@ impl ApiE2e {
         token: Token,
         req: Json<PutE2ePrekeysRequest>,
     ) -> Result<()> {
+        crate::e2ee_v2::validate_authenticated_device(&req.device_id, &token.device)
+            .map_err(|error| Error::from_string(error.to_string(), StatusCode::BAD_REQUEST))?;
         if req.device_id.is_empty() {
             return Err(Error::from_status(StatusCode::BAD_REQUEST));
         }
@@ -385,17 +360,39 @@ impl ApiE2e {
     ) -> Result<()> {
         let raw = base64::decode(req.blob_base64.trim())
             .map_err(|_| Error::from_status(StatusCode::BAD_REQUEST))?;
-        if raw.is_empty() || raw.len() > 2 * 1024 * 1024 {
+        if req.version != 2 || raw.len() < 32 || raw.len() > 8 * 1024 * 1024 {
             return Err(Error::from_status(StatusCode::BAD_REQUEST));
         }
         let now = DateTime::now();
+        if let Some((updated_at,)) = sqlx::query_as::<_, (DateTime,)>(
+            "select updated_at from e2e_backup where uid = ?",
+        )
+        .bind(token.uid)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(InternalServerError)?
+        {
+            if (now.0 - updated_at.0).num_seconds() < 1 {
+                return Err(Error::from_status(StatusCode::TOO_MANY_REQUESTS));
+            }
+        }
         sqlx::query(
             r#"
-            insert into e2e_backup (uid, blob, updated_at) values (?, ?, ?)
-            on conflict(uid) do update set blob = excluded.blob, updated_at = excluded.updated_at
+            insert into e2e_backup
+              (uid, version, size_bytes, updated_by_device, blob, updated_at)
+            values (?, ?, ?, ?, ?, ?)
+            on conflict(uid) do update set
+              version = excluded.version,
+              size_bytes = excluded.size_bytes,
+              updated_by_device = excluded.updated_by_device,
+              blob = excluded.blob,
+              updated_at = excluded.updated_at
             "#,
         )
         .bind(token.uid)
+        .bind(req.version)
+        .bind(raw.len() as i64)
+        .bind(&token.device)
         .bind(raw)
         .bind(now)
         .execute(&state.db_pool)
@@ -411,8 +408,8 @@ impl ApiE2e {
         state: Data<&State>,
         token: Token,
     ) -> Result<Json<E2eBackupResponse>> {
-        let row = sqlx::query_as::<_, (Vec<u8>, DateTime)>(
-            "select blob, updated_at from e2e_backup where uid = ?",
+        let row = sqlx::query_as::<_, (i32, i64, String, Vec<u8>, DateTime)>(
+            "select version, size_bytes, updated_by_device, blob, updated_at from e2e_backup where uid = ?",
         )
         .bind(token.uid)
         .fetch_optional(&state.db_pool)
@@ -421,9 +418,23 @@ impl ApiE2e {
         .ok_or_else(|| Error::from_status(StatusCode::NOT_FOUND))?;
 
         Ok(Json(E2eBackupResponse {
-            blob_base64: base64::encode(&row.0),
-            updated_at: row.1,
+            version: row.0,
+            size_bytes: row.1,
+            updated_by_device: row.2,
+            blob_base64: base64::encode(&row.3),
+            updated_at: row.4,
         }))
+    }
+
+    /// Revoke the account's opaque encrypted backup.
+    #[oai(path = "/backup", method = "delete")]
+    async fn delete_backup(&self, state: Data<&State>, token: Token) -> Result<()> {
+        sqlx::query("delete from e2e_backup where uid = ?")
+            .bind(token.uid)
+            .execute(&state.db_pool)
+            .await
+            .map_err(InternalServerError)?;
+        Ok(())
     }
 
     /// Get DM E2E setting with peer.
@@ -494,178 +505,6 @@ impl ApiE2e {
         }))
     }
 
-    /// Start device-link pairing (logged-in device). Token is short-lived (~10 min).
-    #[oai(path = "/device-link/start", method = "post")]
-    async fn device_link_start(
-        &self,
-        state: Data<&State>,
-        token: Token,
-    ) -> Result<Json<DeviceLinkStartResponse>> {
-        let now = DateTime::now();
-        let expires_at = DateTime(now.0 + chrono::Duration::minutes(10));
-        let link_token = format!("dl_{}", Uuid::new_v4().to_simple());
-
-        // Best-effort cleanup of expired rows for this user.
-        let _ = sqlx::query(
-            "delete from e2e_device_link where uid = ? and (expires_at < ? or consumed_at is not null)",
-        )
-        .bind(token.uid)
-        .bind(now)
-        .execute(&state.db_pool)
-        .await;
-
-        let res = sqlx::query(
-            "insert into e2e_device_link (uid, token, package_blob, created_at, expires_at) values (?, ?, null, ?, ?)",
-        )
-        .bind(token.uid)
-        .bind(&link_token)
-        .bind(now)
-        .bind(expires_at)
-        .execute(&state.db_pool)
-        .await
-        .map_err(InternalServerError)?;
-
-        Ok(Json(DeviceLinkStartResponse {
-            link_id: res.last_insert_rowid(),
-            token: link_token,
-            expires_at,
-        }))
-    }
-
-    /// Upload opaque encrypted identity package for an open link (owner only).
-    #[oai(path = "/device-link/:link_id/package", method = "put")]
-    async fn device_link_put_package(
-        &self,
-        state: Data<&State>,
-        token: Token,
-        link_id: Path<i64>,
-        req: Json<PutDeviceLinkPackageRequest>,
-    ) -> Result<()> {
-        let raw = base64::decode(req.package_base64.trim())
-            .map_err(|_| Error::from_status(StatusCode::BAD_REQUEST))?;
-        if raw.is_empty() || raw.len() > 2 * 1024 * 1024 {
-            return Err(Error::from_status(StatusCode::BAD_REQUEST));
-        }
-        let now = DateTime::now();
-        let row = sqlx::query_as::<_, (i64, DateTime, Option<DateTime>)>(
-            "select uid, expires_at, consumed_at from e2e_device_link where id = ?",
-        )
-        .bind(link_id.0)
-        .fetch_optional(&state.db_pool)
-        .await
-        .map_err(InternalServerError)?
-        .ok_or_else(|| Error::from_status(StatusCode::NOT_FOUND))?;
-
-        if row.0 != token.uid {
-            return Err(Error::from_status(StatusCode::FORBIDDEN));
-        }
-        if row.2.is_some() || row.1 .0 <= now.0 {
-            return Err(Error::from_string(
-                "E2E_DEVICE_LINK_EXPIRED",
-                StatusCode::GONE,
-            ));
-        }
-
-        let n = sqlx::query(
-            "update e2e_device_link set package_blob = ? where id = ? and uid = ? and consumed_at is null",
-        )
-        .bind(raw)
-        .bind(link_id.0)
-        .bind(token.uid)
-        .execute(&state.db_pool)
-        .await
-        .map_err(InternalServerError)?
-        .rows_affected();
-        if n == 0 {
-            return Err(Error::from_status(StatusCode::CONFLICT));
-        }
-        Ok(())
-    }
-
-    /// New device redeems pairing token once and receives the opaque package.
-    #[oai(path = "/device-link/complete", method = "post")]
-    async fn device_link_complete(
-        &self,
-        state: Data<&State>,
-        req: Json<DeviceLinkCompleteRequest>,
-    ) -> Result<Json<DeviceLinkCompleteResponse>> {
-        let token = req.token.trim();
-        if token.is_empty() {
-            return Err(Error::from_status(StatusCode::BAD_REQUEST));
-        }
-        let now = DateTime::now();
-        let mut tx = state.db_pool.begin().await.map_err(InternalServerError)?;
-        let row = sqlx::query_as::<_, (i64, i64, Option<Vec<u8>>, DateTime, Option<DateTime>)>(
-            "select id, uid, package_blob, expires_at, consumed_at from e2e_device_link where token = ?",
-        )
-        .bind(token)
-        .fetch_optional(&mut tx)
-        .await
-        .map_err(InternalServerError)?
-        .ok_or_else(|| Error::from_status(StatusCode::NOT_FOUND))?;
-
-        let (id, uid, package, expires_at, consumed_at) = row;
-        if consumed_at.is_some() || expires_at.0 <= now.0 {
-            return Err(Error::from_string(
-                "E2E_DEVICE_LINK_EXPIRED",
-                StatusCode::GONE,
-            ));
-        }
-        let package = package
-            .ok_or_else(|| Error::from_string("E2E_DEVICE_LINK_PENDING", StatusCode::CONFLICT))?;
-
-        sqlx::query("update e2e_device_link set consumed_at = ?, package_blob = null where id = ?")
-            .bind(now)
-            .bind(id)
-            .execute(&mut tx)
-            .await
-            .map_err(InternalServerError)?;
-        tx.commit().await.map_err(InternalServerError)?;
-
-        Ok(Json(DeviceLinkCompleteResponse {
-            uid,
-            package_base64: base64::encode(&package),
-        }))
-    }
-
-    /// Owner poll: pending | ready | consumed | expired
-    #[oai(path = "/device-link/:link_id", method = "get")]
-    async fn device_link_status(
-        &self,
-        state: Data<&State>,
-        token: Token,
-        link_id: Path<i64>,
-    ) -> Result<Json<DeviceLinkStatus>> {
-        let now = DateTime::now();
-        let row = sqlx::query_as::<_, (i64, Option<Vec<u8>>, DateTime, Option<DateTime>)>(
-            "select uid, package_blob, expires_at, consumed_at from e2e_device_link where id = ?",
-        )
-        .bind(link_id.0)
-        .fetch_optional(&state.db_pool)
-        .await
-        .map_err(InternalServerError)?
-        .ok_or_else(|| Error::from_status(StatusCode::NOT_FOUND))?;
-
-        if row.0 != token.uid {
-            return Err(Error::from_status(StatusCode::FORBIDDEN));
-        }
-        let has_package = row.1.is_some();
-        let status = if row.3.is_some() {
-            "consumed"
-        } else if row.2 .0 <= now.0 {
-            "expired"
-        } else if has_package {
-            "ready"
-        } else {
-            "pending"
-        };
-        Ok(Json(DeviceLinkStatus {
-            link_id: link_id.0,
-            status: status.to_string(),
-            expires_at: row.2,
-            has_package,
-        }))
-    }
 }
 
 /// Build webhook-safe body for E2E chat messages (no plaintext content).
@@ -676,7 +515,7 @@ pub fn redact_e2e_chat_message_json(message: &crate::api::ChatMessage) -> Option
     let is_e2e = match &message.payload.detail {
         MessageDetail::Normal(MessageNormal { content, .. })
         | MessageDetail::Reply(MessageReply { content, .. }) => {
-            content.content_type == "vocechat/e2e"
+            content.content_type == crate::e2ee_v2::CONTENT_TYPE
                 || content
                     .properties
                     .as_ref()
@@ -717,7 +556,9 @@ mod tests {
         let server = TestServer::new().await;
         let admin = server.login_admin().await;
         let uid = server.create_user(&admin, "e2e_user@voce.chat").await;
-        let token = server.login(&format!("e2e_user@voce.chat")).await;
+        let token = server
+            .login_with_device("e2e_user@voce.chat", "web:test")
+            .await;
 
         let resp = server
             .put("/api/user/e2e/identity")
@@ -748,7 +589,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_e2e_protocol_and_device_link() {
+    async fn test_e2e_identity_rejects_another_device_id() {
+        let server = TestServer::new().await;
+        let admin = server.login_admin().await;
+        server.create_user(&admin, "e2e_spoof@voce.chat").await;
+        let token = server
+            .login_with_device("e2e_spoof@voce.chat", "device-real")
+            .await;
+
+        let resp = server
+            .put("/api/user/e2e/identity")
+            .header("X-API-Key", &token)
+            .body_json(&json!({
+                "device_id": "device-other",
+                "identity_key_pub": "pk",
+                "signed_prekey_pub": "spk",
+                "signed_prekey_sig": "sig"
+            }))
+            .send()
+            .await;
+
+        resp.assert_status(poem::http::StatusCode::BAD_REQUEST);
+        resp.assert_text("E2E_DEVICE_MISMATCH").await;
+    }
+
+    #[tokio::test]
+    async fn test_e2e_protocol_requires_v2() {
         let server = TestServer::new().await;
         let admin = server.login_admin().await;
         let _uid = server.create_user(&admin, "e2e_link@voce.chat").await;
@@ -763,44 +629,60 @@ mod tests {
         let body = resp.json().await;
         assert_eq!(body.value().object().get("e2e_protocol_ver").i64(), 2);
 
-        let resp = server
-            .post("/api/user/e2e/device-link/start")
+    }
+
+    #[tokio::test]
+    async fn test_e2e_backup_replace_and_revoke() {
+        let server = TestServer::new().await;
+        let admin = server.login_admin().await;
+        server.create_user(&admin, "e2e_backup@voce.chat").await;
+        let token = server
+            .login_with_device("e2e_backup@voce.chat", "backup-device")
+            .await;
+
+        for byte in [7_u8, 9_u8] {
+            server
+                .put("/api/user/e2e/backup")
+                .header("X-API-Key", &token)
+                .body_json(&json!({
+                    "version": 2,
+                    "blob_base64": base64::encode(vec![byte; 64]),
+                }))
+                .send()
+                .await
+                .assert_status_is_ok();
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        }
+
+        let response = server
+            .get("/api/user/e2e/backup")
             .header("X-API-Key", &token)
             .send()
             .await;
-        resp.assert_status_is_ok();
-        let start = resp.json().await;
-        let link_id = start.value().object().get("link_id").i64();
-        let pair_token = start.value().object().get("token").string().to_string();
-
-        let resp = server
-            .put(format!("/api/user/e2e/device-link/{}/package", link_id))
-            .header("X-API-Key", &token)
-            .body_json(&json!({
-                "package_base64": base64::encode(b"opaque-package")
-            }))
-            .send()
-            .await;
-        resp.assert_status_is_ok();
-
-        let resp = server
-            .post("/api/user/e2e/device-link/complete")
-            .body_json(&json!({ "token": pair_token }))
-            .send()
-            .await;
-        resp.assert_status_is_ok();
-        let done = resp.json().await;
+        response.assert_status_is_ok();
+        let body = response.json().await;
+        assert_eq!(body.value().object().get("version").i64(), 2);
+        assert_eq!(body.value().object().get("size_bytes").i64(), 64);
         assert_eq!(
-            done.value().object().get("package_base64").string(),
-            base64::encode(b"opaque-package")
+            body.value().object().get("updated_by_device").string(),
+            "backup-device"
+        );
+        assert_eq!(
+            body.value().object().get("blob_base64").string(),
+            base64::encode(vec![9_u8; 64])
         );
 
-        // second redeem fails
-        let resp = server
-            .post("/api/user/e2e/device-link/complete")
-            .body_json(&json!({ "token": pair_token }))
+        server
+            .delete("/api/user/e2e/backup")
+            .header("X-API-Key", &token)
             .send()
-            .await;
-        resp.assert_status(poem::http::StatusCode::GONE);
+            .await
+            .assert_status_is_ok();
+        server
+            .get("/api/user/e2e/backup")
+            .header("X-API-Key", &token)
+            .send()
+            .await
+            .assert_status(poem::http::StatusCode::NOT_FOUND);
     }
 }

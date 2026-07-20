@@ -21,6 +21,10 @@ pub enum PayloadKind {
     File = 5,
     Image = 6,
     Voice = 7,
+    Markdown = 8,
+    Delete = 9,
+    Revoke = 10,
+    MembershipNotice = 11,
 }
 
 impl TryFrom<u8> for PayloadKind {
@@ -35,6 +39,10 @@ impl TryFrom<u8> for PayloadKind {
             5 => Ok(Self::File),
             6 => Ok(Self::Image),
             7 => Ok(Self::Voice),
+            8 => Ok(Self::Markdown),
+            9 => Ok(Self::Delete),
+            10 => Ok(Self::Revoke),
+            11 => Ok(Self::MembershipNotice),
             _ => Err(MlsError("unknown application payload kind".into())),
         }
     }
@@ -46,6 +54,98 @@ pub struct ApplicationPayload {
     pub kind: PayloadKind,
     pub body: Vec<u8>,
     pub metadata: BTreeMap<u16, Vec<u8>>,
+}
+
+/// Descriptor encrypted inside a File/Image/Voice application payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentDescriptor {
+    pub path: String,
+    pub key: [u8; 32],
+    pub nonce: [u8; 12],
+    pub sha256: [u8; 32],
+    pub mime: String,
+    pub name: String,
+    pub size: u64,
+}
+
+impl AttachmentDescriptor {
+    pub fn encode(&self) -> Result<Vec<u8>, MlsError> {
+        validate_attachment_text(&self.path, 1024, "path")?;
+        validate_attachment_text(&self.mime, 255, "mime")?;
+        validate_attachment_text(&self.name, 1024, "name")?;
+        let mut output = Vec::new();
+        let mut encoder = Encoder::new(&mut output);
+        encoder.map(7).map_err(cbor_error)?;
+        encoder.u8(0).map_err(cbor_error)?;
+        encoder.str(&self.path).map_err(cbor_error)?;
+        encoder.u8(1).map_err(cbor_error)?;
+        encoder.bytes(&self.key).map_err(cbor_error)?;
+        encoder.u8(2).map_err(cbor_error)?;
+        encoder.bytes(&self.nonce).map_err(cbor_error)?;
+        encoder.u8(3).map_err(cbor_error)?;
+        encoder.bytes(&self.sha256).map_err(cbor_error)?;
+        encoder.u8(4).map_err(cbor_error)?;
+        encoder.str(&self.mime).map_err(cbor_error)?;
+        encoder.u8(5).map_err(cbor_error)?;
+        encoder.str(&self.name).map_err(cbor_error)?;
+        encoder.u8(6).map_err(cbor_error)?;
+        encoder.u64(self.size).map_err(cbor_error)?;
+        Ok(output)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, MlsError> {
+        let mut decoder = Decoder::new(input);
+        if decoder.map().map_err(cbor_error)? != Some(7) {
+            return Err(MlsError("attachment descriptor must be a fixed map".into()));
+        }
+        expect_key(&mut decoder, 0)?;
+        let path = decoder.str().map_err(cbor_error)?.to_owned();
+        expect_key(&mut decoder, 1)?;
+        let key = fixed_bytes::<32>(&mut decoder, "key")?;
+        expect_key(&mut decoder, 2)?;
+        let nonce = fixed_bytes::<12>(&mut decoder, "nonce")?;
+        expect_key(&mut decoder, 3)?;
+        let sha256 = fixed_bytes::<32>(&mut decoder, "sha256")?;
+        expect_key(&mut decoder, 4)?;
+        let mime = decoder.str().map_err(cbor_error)?.to_owned();
+        expect_key(&mut decoder, 5)?;
+        let name = decoder.str().map_err(cbor_error)?.to_owned();
+        expect_key(&mut decoder, 6)?;
+        let size = decoder.u64().map_err(cbor_error)?;
+        if decoder.position() != input.len() {
+            return Err(MlsError("trailing attachment descriptor data".into()));
+        }
+        validate_attachment_text(&path, 1024, "path")?;
+        validate_attachment_text(&mime, 255, "mime")?;
+        validate_attachment_text(&name, 1024, "name")?;
+        Ok(Self {
+            path,
+            key,
+            nonce,
+            sha256,
+            mime,
+            name,
+            size,
+        })
+    }
+}
+
+fn fixed_bytes<const N: usize>(
+    decoder: &mut Decoder<'_>,
+    field: &str,
+) -> Result<[u8; N], MlsError> {
+    decoder
+        .bytes()
+        .map_err(cbor_error)?
+        .try_into()
+        .map_err(|_| MlsError(format!("invalid attachment {field} length")))
+}
+
+fn validate_attachment_text(value: &str, maximum: usize, field: &str) -> Result<(), MlsError> {
+    if value.is_empty() || value.len() > maximum {
+        return Err(MlsError(format!("invalid attachment {field}")));
+    }
+    Ok(())
 }
 
 impl ApplicationPayload {

@@ -1022,6 +1022,18 @@ impl ApiUser {
         req: SendMessageRequest,
     ) -> Result<Json<i64>> {
         let properties = parse_properties_from_base64(properties.0);
+        if matches!(&req, SendMessageRequest::E2eV2(_)) {
+            let route = crate::e2ee_v2::validate_authenticated_sender(
+                properties
+                    .as_ref()
+                    .ok_or_else(|| Error::from_status(StatusCode::BAD_REQUEST))?,
+                &token.device,
+            )
+            .map_err(|error| Error::from_string(error.to_string(), StatusCode::BAD_REQUEST))?;
+            if route.protocol != crate::e2ee_v2::Protocol::Dr {
+                return Err(Error::from_status(StatusCode::BAD_REQUEST));
+            }
+        }
         let payload = req
             .into_chat_message_payload(&state, token.uid, MessageTarget::user(uid.0), properties)
             .await?;
@@ -2038,7 +2050,7 @@ mod tests {
 
     use futures_util::StreamExt;
     use itertools::Itertools;
-    use poem::http::Uri;
+    use poem::http::{StatusCode, Uri};
     use serde::Deserialize;
     use serde_json::json;
 
@@ -2189,6 +2201,141 @@ mod tests {
         let properties = detail.get("properties").object();
         properties.get("a").assert_i64(10);
         properties.get("b").assert_string("abc");
+    }
+
+    #[tokio::test]
+    async fn test_e2e_v2_dm_uses_normal_mid_history_and_sse() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid1 = server.create_user(&admin_token, "user1@voce.chat").await;
+        let token1 = server.login("user1@voce.chat").await;
+        let mut events1 = server.subscribe_events(&token1, Some(&["chat"])).await;
+        let properties = json!({
+            "e2e_version": 2,
+            "protocol": "dr",
+            "wire_class": "dr_envelope",
+            "sender_device_id": "device-admin",
+            "recipient_device_id": "device-user1",
+            "local_id": "local-dm-1"
+        });
+
+        let resp = server
+            .post(format!("/api/user/{uid1}/send"))
+            .header("X-API-Key", &admin_token)
+            .header(
+                "X-Properties",
+                base64::encode(serde_json::to_string(&properties).unwrap()),
+            )
+            .content_type(crate::e2ee_v2::CONTENT_TYPE)
+            .body("opaque-dr-envelope-base64")
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let mid = resp.json().await.value().i64();
+
+        let event = events1.next().await.unwrap();
+        let event = event.value().object();
+        event.get("mid").assert_i64(mid);
+        let detail = event.get("detail").object();
+        detail
+            .get("content_type")
+            .assert_string(crate::e2ee_v2::CONTENT_TYPE);
+        detail
+            .get("content")
+            .assert_string("opaque-dr-envelope-base64");
+        let stored = detail.get("properties").object();
+        stored.get("e2e_version").assert_i64(2);
+        stored.get("protocol").assert_string("dr");
+        stored.get("wire_class").assert_string("dr_envelope");
+        stored.get("sender_device_id").assert_string("device-admin");
+        stored
+            .get("recipient_device_id")
+            .assert_string("device-user1");
+        stored.get("local_id").assert_string("local-dm-1");
+
+        let history = server
+            .get(format!("/api/user/{uid1}/history"))
+            .header("X-API-Key", &admin_token)
+            .send()
+            .await;
+        history.assert_status_is_ok();
+        let history = history.json().await;
+        let row = history
+            .value()
+            .array()
+            .iter()
+            .find(|row| row.object().get("mid").i64() == mid)
+            .expect("v2 message in DM history")
+            .object();
+        let detail = row.get("detail").object();
+        detail
+            .get("content_type")
+            .assert_string(crate::e2ee_v2::CONTENT_TYPE);
+        detail
+            .get("content")
+            .assert_string("opaque-dr-envelope-base64");
+        detail
+            .get("properties")
+            .object()
+            .get("local_id")
+            .assert_string("local-dm-1");
+    }
+
+    #[tokio::test]
+    async fn test_e2e_v2_dm_rejects_invalid_routing_properties() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin().await;
+        let uid1 = server.create_user(&admin_token, "user1@voce.chat").await;
+
+        for properties in [
+            json!({"e2e_version":1,"protocol":"dr","wire_class":"dr_envelope","sender_device_id":"a","recipient_device_id":"b","local_id":"c"}),
+            json!({"e2e_version":2,"protocol":"dr","wire_class":"mls_application","sender_device_id":"a","recipient_device_id":"b","local_id":"c"}),
+            json!({"e2e_version":2,"protocol":"dr","wire_class":"dr_envelope","sender_device_id":"a","local_id":"c"}),
+            json!({"e2e_version":2,"protocol":"mls","wire_class":"mls_application","sender_device_id":"a","local_id":"c","mls_epoch":0,"mls_generation":0}),
+        ] {
+            let resp = server
+                .post(format!("/api/user/{uid1}/send"))
+                .header("X-API-Key", &admin_token)
+                .header(
+                    "X-Properties",
+                    base64::encode(serde_json::to_string(&properties).unwrap()),
+                )
+                .content_type(crate::e2ee_v2::CONTENT_TYPE)
+                .body("opaque")
+                .send()
+                .await;
+            resp.assert_status(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_e2e_v2_dm_rejects_spoofed_sender_device() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid1 = server.create_user(&admin_token, "user1@voce.chat").await;
+        let properties = json!({
+            "e2e_version": 2,
+            "protocol": "dr",
+            "wire_class": "dr_envelope",
+            "sender_device_id": "device-other",
+            "recipient_device_id": "device-user1",
+            "local_id": "spoofed-device"
+        });
+
+        let resp = server
+            .post(format!("/api/user/{uid1}/send"))
+            .header("X-API-Key", &admin_token)
+            .header(
+                "X-Properties",
+                base64::encode(serde_json::to_string(&properties).unwrap()),
+            )
+            .content_type(crate::e2ee_v2::CONTENT_TYPE)
+            .body("opaque")
+            .send()
+            .await;
+
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        resp.assert_text("E2E_DEVICE_MISMATCH").await;
     }
 
     #[tokio::test]

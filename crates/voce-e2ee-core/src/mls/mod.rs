@@ -237,6 +237,11 @@ impl MlsWelcome {
 }
 
 impl MlsGroupState {
+    /// Current RFC 9420 group epoch for authenticated routing metadata.
+    pub fn epoch(&self) -> u64 {
+        self.group.epoch().as_u64()
+    }
+
     /// Return authenticated BasicCredential identities currently in the tree.
     pub fn member_identities(&self) -> Vec<Vec<u8>> {
         self.group

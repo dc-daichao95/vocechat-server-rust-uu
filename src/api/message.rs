@@ -88,7 +88,9 @@ impl ChatMessageContent {
             }
             "text/markdown" => Some("You have a new message".to_string()),
             "vocechat/file" => Some("You have a new file".to_string()),
-            "vocechat/e2e" => Some("You have a new message".to_string()),
+            crate::e2ee_v2::CONTENT_TYPE => {
+                Some("You have a new message".to_string())
+            }
             _ => {
                 if self
                     .properties
@@ -559,9 +561,9 @@ pub enum SendMessageRequest {
     File(Json<FileInfo>),
     #[oai(content_type = "vocechat/archive")]
     Archive(PlainText<String>),
-    /// Opaque end-to-end encrypted envelope (server must not parse content)
-    #[oai(content_type = "vocechat/e2e")]
-    E2e(PlainText<String>),
+    /// Version 2 opaque DR/MLS envelope carried by the normal message plane.
+    #[oai(content_type = "application/vnd.vocechat.e2ee.v2")]
+    E2eV2(PlainText<String>),
 }
 
 impl SendMessageRequest {
@@ -616,15 +618,13 @@ impl SendMessageRequest {
                 content_type: "vocechat/archive".to_string(),
                 content: path.0,
             }),
-            SendMessageRequest::E2e(cipher) => {
-                let mut properties = properties.unwrap_or_default();
-                properties.insert("e2e".to_string(), Value::Bool(true));
-                if !properties.contains_key("e2e_ver") {
-                    properties.insert("e2e_ver".to_string(), Value::from(1));
-                }
+            SendMessageRequest::E2eV2(cipher) => {
+                let properties =
+                    properties.ok_or_else(|| Error::from_status(StatusCode::BAD_REQUEST))?;
+                crate::e2ee_v2::validate_properties(&properties).map_err(BadRequest)?;
                 Ok(ChatMessageContent {
                     properties: Some(properties),
-                    content_type: "vocechat/e2e".to_string(),
+                    content_type: crate::e2ee_v2::CONTENT_TYPE.to_owned(),
                     content: cipher.0,
                 })
             }
@@ -862,8 +862,13 @@ fn internal_send_message(
     Ok(msg_id)
 }
 
-/// When a DM/channel session has E2E enabled, reject non-`vocechat/e2e` chat bodies.
+/// When a DM/channel session has E2E enabled, reject non-E2EE chat bodies.
 async fn enforce_e2e_required(state: &State, payload: &ChatMessagePayload) -> poem::Result<()> {
+    let generation_two = state
+        .get_dynamic_config_instance::<LoginConfig>()
+        .await
+        .map(|config| config.e2e_protocol_ver >= 2)
+        .unwrap_or(true);
     let content = match &payload.detail {
         MessageDetail::Normal(MessageNormal { content, .. })
         | MessageDetail::Reply(MessageReply { content, .. }) => Some(content),
@@ -873,13 +878,20 @@ async fn enforce_e2e_required(state: &State, payload: &ChatMessagePayload) -> po
         },
     };
     let Some(content) = content else {
-        return Ok(());
+        return if generation_two {
+            Err(Error::from_string("E2E_REQUIRED", StatusCode::FORBIDDEN))
+        } else {
+            Ok(())
+        };
     };
-    if content.content_type == "vocechat/e2e" {
+    if matches!(
+        content.content_type.as_str(),
+        crate::e2ee_v2::CONTENT_TYPE
+    ) {
         return Ok(());
     }
 
-    let required = match payload.target {
+    let required = generation_two || match payload.target {
         MessageTarget::User(MessageTargetUser { uid }) => {
             let lo = payload.from_uid.min(uid);
             let hi = payload.from_uid.max(uid);
@@ -910,17 +922,7 @@ async fn enforce_e2e_required(state: &State, payload: &ChatMessagePayload) -> po
     Ok(())
 }
 
-/// Generation 2 uses only the opaque MLS delivery API. Legacy JSON envelopes are rejected.
-async fn enforce_e2e_protocol_ver(state: &State, payload: &ChatMessagePayload) -> poem::Result<()> {
-    let required = state
-        .get_dynamic_config_instance::<LoginConfig>()
-        .await
-        .map(|c| c.e2e_protocol_ver)
-        .unwrap_or(1);
-    if required < 2 {
-        return Ok(());
-    }
-
+fn enforce_e2e_v2_target_protocol(payload: &ChatMessagePayload) -> poem::Result<()> {
     let content = match &payload.detail {
         MessageDetail::Normal(MessageNormal { content, .. })
         | MessageDetail::Reply(MessageReply { content, .. }) => Some(content),
@@ -932,19 +934,31 @@ async fn enforce_e2e_protocol_ver(state: &State, payload: &ChatMessagePayload) -
     let Some(content) = content else {
         return Ok(());
     };
-    if content.content_type != "vocechat/e2e" {
+    if content.content_type != crate::e2ee_v2::CONTENT_TYPE {
         return Ok(());
     }
 
-    Err(Error::from_string(
-        "E2E_UPGRADE_REQUIRED",
-        StatusCode::FORBIDDEN,
-    ))
+    let properties = content
+        .properties
+        .as_ref()
+        .ok_or_else(|| Error::from_status(StatusCode::BAD_REQUEST))?;
+    let routing = crate::e2ee_v2::validate_properties(properties).map_err(BadRequest)?;
+    if !matches!(
+        (payload.target, routing.protocol),
+        (MessageTarget::User(_), crate::e2ee_v2::Protocol::Dr)
+            | (MessageTarget::Group(_), crate::e2ee_v2::Protocol::Mls)
+    ) {
+        return Err(Error::from_string(
+            "E2E_PROTOCOL_TARGET_MISMATCH",
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    Ok(())
 }
 
 pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poem::Result<i64> {
+    enforce_e2e_v2_target_protocol(&payload)?;
     enforce_e2e_required(state, &payload).await?;
-    enforce_e2e_protocol_ver(state, &payload).await?;
 
     let cache = state.cache.read().await;
 

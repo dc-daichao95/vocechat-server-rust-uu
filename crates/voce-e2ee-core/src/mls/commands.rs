@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Map, Value};
 
-use super::application::{ApplicationPayload, PayloadKind};
+use super::application::{ApplicationPayload, AttachmentDescriptor, PayloadKind};
 use super::{MlsClient, MlsError, MlsGroupState, MlsKeyPackage, MlsProcessed, MlsWelcome};
 
 const MAX_IDENTITY: usize = 255;
@@ -24,14 +24,71 @@ pub fn dispatch(method: &str, args: &Value) -> Result<Value, MlsError> {
         "mls_group_add" => group_add(args),
         "mls_group_add_many" => group_add_many(args),
         "mls_group_members" => group_members(args),
+        "mls_group_info" => group_info(args),
         "mls_group_remove" => group_remove(args),
         "mls_group_join" => group_join(args),
         "mls_application_encode" => application_encode(args),
         "mls_application_decode" => application_decode(args),
+        "e2ee_attachment_encode" => attachment_encode(args),
+        "e2ee_attachment_decode" => attachment_decode(args),
         "mls_encrypt" => encrypt(args),
         "mls_decrypt" => decrypt(args),
         _ => Err(MlsError("unknown MLS command".into())),
     }
+}
+
+fn attachment_encode(args: &Value) -> Result<Value, MlsError> {
+    let fixed = |key: &str, length: usize| -> Result<Vec<u8>, MlsError> {
+        let value = decode(args, key, length)?;
+        if value.len() != length {
+            return Err(MlsError(format!("invalid {key} length")));
+        }
+        Ok(value)
+    };
+    let descriptor = AttachmentDescriptor {
+        path: required_string(args, "path")?,
+        key: fixed("key_b64", 32)?.try_into().unwrap(),
+        nonce: fixed("nonce_b64", 12)?.try_into().unwrap(),
+        sha256: fixed("sha256_b64", 32)?.try_into().unwrap(),
+        mime: required_string(args, "mime")?,
+        name: required_string(args, "name")?,
+        size: args
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| MlsError("invalid attachment size".into()))?,
+    };
+    Ok(json!({"descriptor_b64": B64.encode(descriptor.encode()?)}))
+}
+
+fn attachment_decode(args: &Value) -> Result<Value, MlsError> {
+    let descriptor = AttachmentDescriptor::decode(&decode(
+        args,
+        "descriptor_b64",
+        MAX_APPLICATION,
+    )?)?;
+    Ok(json!({
+        "path": descriptor.path,
+        "key_b64": B64.encode(descriptor.key),
+        "nonce_b64": B64.encode(descriptor.nonce),
+        "sha256_b64": B64.encode(descriptor.sha256),
+        "mime": descriptor.mime,
+        "name": descriptor.name,
+        "size": descriptor.size,
+    }))
+}
+
+fn required_string(args: &Value, key: &str) -> Result<String, MlsError> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| MlsError(format!("missing {key}")))
+}
+
+fn group_info(args: &Value) -> Result<Value, MlsError> {
+    let state = decode(args, "group_state_b64", MAX_STATE)?;
+    let group = MlsGroupState::restore(&state)?;
+    Ok(json!({"epoch": group.epoch()}))
 }
 
 fn device_generate(args: &Value) -> Result<Value, MlsError> {

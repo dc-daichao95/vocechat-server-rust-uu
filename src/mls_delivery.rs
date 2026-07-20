@@ -4,19 +4,29 @@ use uuid::Uuid;
 
 const MAX_CREDENTIAL: usize = 64 * 1024;
 const MAX_KEY_PACKAGE: usize = 64 * 1024;
-const MAX_ARTIFACT: usize = 2 * 1024 * 1024;
-const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn validate_device_id(device_id: &str) -> Result<()> {
     if device_id.is_empty()
         || device_id.len() > 128
         || !device_id
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
     {
         return Err(Error::from_status(StatusCode::BAD_REQUEST));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod device_id_tests {
+    use super::validate_device_id;
+
+    #[test]
+    fn accepts_authenticated_web_and_mobile_device_ids() {
+        assert!(validate_device_id("web:install_123-abc").is_ok());
+        assert!(validate_device_id("Android:install-123").is_ok());
+        assert!(validate_device_id("../other-device").is_err());
+    }
 }
 
 pub fn validate_blob(blob: &[u8], maximum: usize) -> Result<()> {
@@ -217,57 +227,6 @@ pub async fn mark_initialized(
     }
 }
 
-pub async fn append_artifact(
-    db: &SqlitePool,
-    uid: i64,
-    device_id: &str,
-    token: &str,
-    payload: &[u8],
-) -> Result<i64> {
-    validate_device_id(device_id)?;
-    validate_blob(payload, MAX_ARTIFACT)?;
-    authorize_route(db, uid, token).await?;
-    let result = sqlx::query(
-        "insert into mls_artifact (route_token, sender_uid, device_id, payload) values (?, ?, ?, ?)",
-    )
-    .bind(token)
-    .bind(uid)
-    .bind(device_id)
-    .bind(payload)
-    .execute(db)
-    .await;
-    match result {
-        Ok(done) => Ok(done.last_insert_rowid()),
-        Err(sqlx::Error::Database(error)) if is_foreign_key_violation(error.as_ref()) => {
-            Err(Error::from_status(StatusCode::CONFLICT))
-        }
-        Err(error) => Err(InternalServerError(error)),
-    }
-}
-
 fn is_foreign_key_violation(error: &dyn sqlx::error::DatabaseError) -> bool {
     error.message().contains("FOREIGN KEY constraint failed")
-}
-
-pub async fn read_artifacts(db: &SqlitePool, uid: i64, token: &str, after: i64) -> Result<Vec<u8>> {
-    authorize_route(db, uid, token).await?;
-    let rows = sqlx::query_as::<_, (i64, Vec<u8>)>(
-        "select sequence, payload from mls_artifact where route_token = ? and sequence > ? order by sequence limit 256",
-    )
-    .bind(token)
-    .bind(after.max(0))
-    .fetch_all(db)
-    .await
-    .map_err(InternalServerError)?;
-    let mut output = Vec::new();
-    for (sequence, payload) in rows {
-        let required = 12usize.saturating_add(payload.len());
-        if output.len().saturating_add(required) > MAX_BATCH_BYTES {
-            break;
-        }
-        output.extend_from_slice(&(sequence as u64).to_be_bytes());
-        output.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        output.extend_from_slice(&payload);
-    }
-    Ok(output)
 }

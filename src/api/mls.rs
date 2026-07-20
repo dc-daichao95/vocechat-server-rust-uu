@@ -1,6 +1,6 @@
 use poem::{error::InternalServerError, http::StatusCode, web::Data, Error, Result};
 use poem_openapi::{
-    param::{Path, Query},
+    param::Path,
     payload::{Binary, Json},
     Object, OpenApi,
 };
@@ -27,6 +27,7 @@ impl ApiMls {
         device_id: Path<String>,
         body: Binary<Vec<u8>>,
     ) -> Result<()> {
+        require_authenticated_device(&token, &device_id)?;
         mls_delivery::put_credential(&state.db_pool, token.uid, &device_id, &body).await
     }
 
@@ -76,6 +77,7 @@ impl ApiMls {
         device_id: Path<String>,
         body: Binary<Vec<u8>>,
     ) -> Result<()> {
+        require_authenticated_device(&token, &device_id)?;
         mls_delivery::publish_key_package(&state.db_pool, token.uid, &device_id, &body).await
     }
 
@@ -103,22 +105,6 @@ impl ApiMls {
         Ok(Binary(route.into_bytes()))
     }
 
-    #[oai(path = "/route/:route/:device_id", method = "post")]
-    async fn append_artifact(
-        &self,
-        state: Data<&State>,
-        token: Token,
-        route: Path<String>,
-        device_id: Path<String>,
-        body: Binary<Vec<u8>>,
-    ) -> Result<Binary<Vec<u8>>> {
-        validate_route(&route)?;
-        let sequence =
-            mls_delivery::append_artifact(&state.db_pool, token.uid, &device_id, &route, &body)
-                .await?;
-        Ok(Binary((sequence as u64).to_be_bytes().to_vec()))
-    }
-
     #[oai(path = "/route/:route/:device_id/claim", method = "post")]
     async fn claim_initialization(
         &self,
@@ -127,6 +113,7 @@ impl ApiMls {
         route: Path<String>,
         device_id: Path<String>,
     ) -> Result<Binary<Vec<u8>>> {
+        require_authenticated_device(&token, &device_id)?;
         validate_route(&route)?;
         let status =
             mls_delivery::claim_initialization(&state.db_pool, token.uid, &device_id, &route)
@@ -142,23 +129,16 @@ impl ApiMls {
         route: Path<String>,
         device_id: Path<String>,
     ) -> Result<()> {
+        require_authenticated_device(&token, &device_id)?;
         validate_route(&route)?;
         mls_delivery::mark_initialized(&state.db_pool, token.uid, &device_id, &route).await
     }
 
-    #[oai(path = "/route/:route", method = "get")]
-    async fn read_artifacts(
-        &self,
-        state: Data<&State>,
-        token: Token,
-        route: Path<String>,
-        #[oai(default)] after: Query<i64>,
-    ) -> Result<Binary<Vec<u8>>> {
-        validate_route(&route)?;
-        Ok(Binary(
-            mls_delivery::read_artifacts(&state.db_pool, token.uid, &route, after.0).await?,
-        ))
-    }
+}
+
+fn require_authenticated_device(token: &Token, device_id: &str) -> Result<()> {
+    crate::e2ee_v2::validate_authenticated_device(device_id, &token.device)
+        .map_err(|error| Error::from_string(error.to_string(), StatusCode::BAD_REQUEST))
 }
 
 fn validate_route(route: &str) -> Result<()> {
@@ -177,7 +157,7 @@ mod tests {
     #[tokio::test]
     async fn opaque_binary_delivery_roundtrip() {
         let server = TestServer::new().await;
-        let token = server.login_admin().await;
+        let token = server.login_admin_with_device("phone").await;
         let user = server.parse_token(&token).await;
 
         let put = server
@@ -255,23 +235,21 @@ mod tests {
             .assert_bytes(&[2])
             .await;
 
-        let append = server
-            .post(format!("/api/user/mls/route/{route}/phone"))
+    }
+
+    #[tokio::test]
+    async fn rejects_credential_write_for_another_device() {
+        let server = TestServer::new().await;
+        let token = server.login_admin_with_device("phone").await;
+        let response = server
+            .put("/api/user/mls/device/tablet/credential")
             .header("X-API-Key", &token)
             .content_type("application/octet-stream")
-            .body(b"opaque private message".to_vec())
+            .body(b"public credential".to_vec())
             .send()
             .await;
-        append.assert_status_is_ok();
-        let batch = server
-            .get(format!("/api/user/mls/route/{route}?after=0"))
-            .header("X-API-Key", &token)
-            .send()
-            .await;
-        batch.assert_status_is_ok();
-        let bytes = batch.0.into_body().into_vec().await.unwrap();
-        assert_eq!(&bytes[12..], b"opaque private message");
-        assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()), 22);
+        response.assert_status(poem::http::StatusCode::BAD_REQUEST);
+        response.assert_text("E2E_DEVICE_MISMATCH").await;
     }
 
     #[tokio::test]

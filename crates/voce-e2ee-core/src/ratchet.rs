@@ -176,6 +176,17 @@ impl RatchetState {
     }
 
     pub fn decrypt(&mut self, header: &RatchetHeader, ciphertext: &[u8]) -> Result<Vec<u8>, E2eError> {
+        let mut staged = self.clone();
+        let plaintext = staged.decrypt_staged(header, ciphertext)?;
+        *self = staged;
+        Ok(plaintext)
+    }
+
+    fn decrypt_staged(
+        &mut self,
+        header: &RatchetHeader,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, E2eError> {
         if let Some(pt) = self.try_skipped(header, ciphertext)? {
             return Ok(pt);
         }
@@ -280,6 +291,58 @@ fn open_aes_gcm(mk: &[u8; 32], ciphertext: &[u8], header: &RatchetHeader) -> Res
             },
         )
         .map_err(|_| E2eError::DecryptFailed)
+}
+
+#[cfg(test)]
+mod transactional_tests {
+    use super::RatchetState;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    fn session_pair() -> (RatchetState, RatchetState) {
+        let shared = [7_u8; 32];
+        let bob_secret = StaticSecret::from([9_u8; 32]);
+        let bob_public = PublicKey::from(&bob_secret);
+        (
+            RatchetState::init_alice(shared, &bob_public).unwrap(),
+            RatchetState::init_bob(shared, bob_secret.to_bytes()),
+        )
+    }
+
+    #[test]
+    fn replay_does_not_advance_the_receive_chain() {
+        let (mut alice, mut bob) = session_pair();
+        let (first_header, first_ciphertext) = alice.encrypt(b"first").unwrap();
+        let (second_header, second_ciphertext) = alice.encrypt(b"second").unwrap();
+
+        assert_eq!(
+            bob.decrypt(&first_header, &first_ciphertext).unwrap(),
+            b"first"
+        );
+        assert!(bob.decrypt(&first_header, &first_ciphertext).is_err());
+        assert_eq!(
+            bob.decrypt(&second_header, &second_ciphertext).unwrap(),
+            b"second"
+        );
+    }
+
+    #[test]
+    fn tampered_out_of_order_message_does_not_consume_its_skipped_key() {
+        let (mut alice, mut bob) = session_pair();
+        let (first_header, first_ciphertext) = alice.encrypt(b"first").unwrap();
+        let (second_header, second_ciphertext) = alice.encrypt(b"second").unwrap();
+
+        assert_eq!(
+            bob.decrypt(&second_header, &second_ciphertext).unwrap(),
+            b"second"
+        );
+        let mut tampered = first_ciphertext.clone();
+        tampered[0] ^= 1;
+        assert!(bob.decrypt(&first_header, &tampered).is_err());
+        assert_eq!(
+            bob.decrypt(&first_header, &first_ciphertext).unwrap(),
+            b"first"
+        );
+    }
 }
 
 #[cfg(test)]

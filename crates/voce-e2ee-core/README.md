@@ -21,9 +21,7 @@ Shared Rust crate for VoceChat **E2EE v2** (X3DH + Double Ratchet + Sender Keys)
 | `identity` | X25519 IK + Ed25519 signing, signed prekeys, safety number |
 | `x3dh` | Signal X3DH §2.2 agreement (X25519) |
 | `ratchet` | Minimal Double Ratchet (DM) |
-| `sender_keys` | Channel sender-key chain + rotate |
 | `envelope` | v2 wire JSON + replay window |
-| `v1_compat` | Read-only P-256 / MK+AES-GCM decrypt |
 | `ffi` | `voce_e2ee_call` / `voce_e2ee_free` + WASM `voce_e2ee_wasm_call` |
 
 ## Dependency / license audit

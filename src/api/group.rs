@@ -6,7 +6,7 @@ use std::{
 use chrono::Utc;
 use itertools::Itertools;
 use poem::{
-    error::{InternalServerError, ReadBodyError},
+    error::{BadRequest, InternalServerError, ReadBodyError},
     http::StatusCode,
     web::Data,
     Error, Result,
@@ -28,7 +28,7 @@ use crate::{
         token::Token,
         user::{UploadAvatarApiResponse, UploadAvatarRequest},
         AgoraConfig, ChatMessage, DateTime, GroupChangedMessage, KickFromGroupReason,
-        MessageTarget,
+        MessageDetail, MessageTarget,
     },
     middleware::guest_forbidden,
     state::{BroadcastEvent, Cache, CacheGroup, GroupType},
@@ -86,7 +86,7 @@ pub struct Group {
     /// Pinned messages
     #[oai(read_only)]
     pub pinned_messages: Vec<PinnedMessage>,
-    /// When true, clients SHOULD send new messages as vocechat/e2e
+    /// When true, clients must send generation-2 opaque encrypted messages.
     #[oai(default = "default_group_e2e_enabled")]
     pub e2e_enabled: bool,
 }
@@ -889,9 +889,43 @@ impl ApiGroup {
         req: SendMessageRequest,
     ) -> Result<Json<i64>> {
         let properties = parse_properties_from_base64(properties.0);
+        if matches!(&req, SendMessageRequest::E2eV2(_)) {
+            crate::e2ee_v2::validate_authenticated_sender(
+                properties
+                    .as_ref()
+                    .ok_or_else(|| Error::from_status(StatusCode::BAD_REQUEST))?,
+                &token.device,
+            )
+            .map_err(|error| Error::from_string(error.to_string(), StatusCode::BAD_REQUEST))?;
+        }
         let payload = req
             .into_chat_message_payload(&state, token.uid, MessageTarget::group(gid.0), properties)
             .await?;
+        if let MessageDetail::Normal(normal) = &payload.detail {
+            if normal.content.content_type == crate::e2ee_v2::CONTENT_TYPE {
+                let route = crate::e2ee_v2::validate_properties(
+                    normal
+                        .content
+                        .properties
+                        .as_ref()
+                        .ok_or_else(|| Error::from_status(StatusCode::BAD_REQUEST))?,
+                )
+                .map_err(BadRequest)?;
+                if route.protocol != crate::e2ee_v2::Protocol::Mls {
+                    return Err(Error::from_status(StatusCode::BAD_REQUEST));
+                }
+                crate::e2ee_v2::reserve_mls_sequence(&state.db_pool, gid.0, token.uid, &route)
+                    .await
+                    .map_err(|error| match error {
+                        crate::e2ee_v2::MlsSequenceError::Conflict => {
+                            Error::from_string("E2E_MLS_SEQUENCE_CONFLICT", StatusCode::CONFLICT)
+                        }
+                        crate::e2ee_v2::MlsSequenceError::Database(error) => {
+                            InternalServerError(error)
+                        }
+                    })?;
+            }
+        }
         let mid = send_message(&state, payload).await?;
         Ok(Json(mid))
     }
@@ -1595,6 +1629,176 @@ mod tests {
             let msg = events.next().await.unwrap();
             assert_eq!(msg.value().object().get("mid").i64(), id3);
         }
+    }
+
+    #[tokio::test]
+    async fn test_e2e_v2_mls_application_uses_group_mid_history_and_sse() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid1 = server.create_user(&admin_token, "user1@voce.chat").await;
+        let token1 = server.login("user1@voce.chat").await;
+
+        let resp = server
+            .post("/api/group")
+            .header("X-API-Key", &admin_token)
+            .body_json(&json!({
+                "name": "e2e-v2-test",
+                "members": [uid1]
+            }))
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let gid = resp.json().await.value().object().get("gid").i64();
+        let mut events1 = server.subscribe_events(&token1, Some(&["chat"])).await;
+        let properties = json!({
+            "e2e_version": 2,
+            "protocol": "mls",
+            "wire_class": "mls_application",
+            "sender_device_id": "device-admin",
+            "local_id": "local-channel-1",
+            "mls_epoch": 0,
+            "mls_generation": 0
+        });
+
+        let resp = server
+            .post(format!("/api/group/{gid}/send"))
+            .header("X-API-Key", &admin_token)
+            .header(
+                "X-Properties",
+                base64::encode(serde_json::to_string(&properties).unwrap()),
+            )
+            .content_type(crate::e2ee_v2::CONTENT_TYPE)
+            .body("opaque-mls-ciphertext-base64")
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let mid = resp.json().await.value().i64();
+        assert!(mid < 4_000_000_000_000_000_i64);
+
+        let event = events1.next().await.unwrap();
+        let event = event.value().object();
+        event.get("mid").assert_i64(mid);
+        event.get("target").object().get("gid").assert_i64(gid);
+        let detail = event.get("detail").object();
+        detail
+            .get("content_type")
+            .assert_string(crate::e2ee_v2::CONTENT_TYPE);
+        detail
+            .get("content")
+            .assert_string("opaque-mls-ciphertext-base64");
+        let stored = detail.get("properties").object();
+        stored.get("e2e_version").assert_i64(2);
+        stored.get("protocol").assert_string("mls");
+        stored.get("wire_class").assert_string("mls_application");
+        stored.get("local_id").assert_string("local-channel-1");
+        stored.get("mls_epoch").assert_i64(0);
+        stored.get("mls_generation").assert_i64(0);
+
+        let history = server
+            .get(format!("/api/group/{gid}/history"))
+            .header("X-API-Key", &admin_token)
+            .send()
+            .await;
+        history.assert_status_is_ok();
+        let history = history.json().await;
+        let matches = history
+            .value()
+            .array()
+            .iter()
+            .filter(|row| row.object().get("mid").i64() == mid)
+            .collect_vec();
+        assert_eq!(matches.len(), 1);
+        let row = matches[0].object();
+        let detail = row.get("detail").object();
+        detail
+            .get("content_type")
+            .assert_string(crate::e2ee_v2::CONTENT_TYPE);
+        detail
+            .get("content")
+            .assert_string("opaque-mls-ciphertext-base64");
+        detail
+            .get("properties")
+            .object()
+            .get("local_id")
+            .assert_string("local-channel-1");
+        for row in history.value().array().iter() {
+            assert!(row.object().get("mid").i64() < 4_000_000_000_000_000_i64);
+        }
+
+        let dr_properties = json!({
+            "e2e_version": 2,
+            "protocol": "dr",
+            "wire_class": "dr_envelope",
+            "sender_device_id": "device-admin",
+            "recipient_device_id": "device-user1",
+            "local_id": "wrong-protocol"
+        });
+        let resp = server
+            .post(format!("/api/group/{gid}/send"))
+            .header("X-API-Key", &admin_token)
+            .header(
+                "X-Properties",
+                base64::encode(serde_json::to_string(&dr_properties).unwrap()),
+            )
+            .content_type(crate::e2ee_v2::CONTENT_TYPE)
+            .body("opaque")
+            .send()
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_e2e_v2_rejects_conflicting_mls_commit_and_accepts_matching_welcome() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let response = server
+            .post("/api/group")
+            .header("X-API-Key", &admin_token)
+            .body_json(&json!({"name": "mls-sequence", "members": []}))
+            .send()
+            .await;
+        response.assert_status_is_ok();
+        let gid = response.json().await.value().object().get("gid").i64();
+
+        let send_handshake = |kind: &str, commit_id: &str, local_id: &str| {
+            let properties = json!({
+                "e2e_version": 2,
+                "protocol": "mls",
+                "wire_class": "mls_handshake",
+                "mls_handshake_kind": kind,
+                "mls_commit_id": commit_id,
+                "sender_device_id": "device-admin",
+                "local_id": local_id,
+                "mls_epoch": 1,
+                "mls_generation": 0
+            });
+            server
+                .post(format!("/api/group/{gid}/send"))
+                .header("X-API-Key", &admin_token)
+                .header(
+                    "X-Properties",
+                    base64::encode(serde_json::to_string(&properties).unwrap()),
+                )
+                .content_type(crate::e2ee_v2::CONTENT_TYPE)
+                .body("opaque-mls-handshake")
+        };
+
+        send_handshake("commit", "commit-a", "local-commit-a")
+            .send()
+            .await
+            .assert_status_is_ok();
+        send_handshake("commit", "commit-b", "local-commit-b")
+            .send()
+            .await
+            .assert_status(StatusCode::CONFLICT);
+        send_handshake("welcome", "commit-a", "local-welcome-a")
+            .send()
+            .await
+            .assert_status_is_ok();
+        send_handshake("welcome", "unknown-commit", "local-welcome-b")
+            .send()
+            .await
+            .assert_status(StatusCode::CONFLICT);
     }
 
     #[tokio::test]

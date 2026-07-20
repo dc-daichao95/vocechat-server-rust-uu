@@ -3,13 +3,11 @@ use std::collections::HashSet;
 
 use crate::error::E2eError;
 use crate::ratchet::RatchetHeader;
-use crate::sender_keys::SenderKeyHeader;
 
 /// Wire-format version carried in message `properties.e2e_ver`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum E2eVersion {
-    V1 = 1,
     V2 = 2,
 }
 
@@ -18,7 +16,6 @@ impl TryFrom<u8> for E2eVersion {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(Self::V1),
             2 => Ok(Self::V2),
             other => Err(E2eError::UnsupportedVersion(other)),
         }
@@ -37,12 +34,6 @@ pub enum EnvelopeV2Body {
         x3dh_initial: Option<crate::x3dh::X3dhInitialMessage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         used_signed_prekey_id: Option<u32>,
-    },
-    #[serde(rename = "SK+AES-GCM")]
-    SenderKey {
-        header: SenderKeyHeader,
-        ciphertext_b64: String,
-        gid: i64,
     },
 }
 

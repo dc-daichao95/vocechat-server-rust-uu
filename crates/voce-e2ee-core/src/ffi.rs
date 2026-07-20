@@ -51,16 +51,19 @@ pub fn dispatch(method: &str, args: &Value) -> String {
             },
             None => err("missing json"),
         },
-        "v1_decrypt" => v1_decrypt(args),
         "ratchet_init_alice" => ratchet_init_alice(args),
         "ratchet_init_bob" => ratchet_init_bob(args),
         "ratchet_encrypt" => ratchet_encrypt(args),
         "ratchet_decrypt" => ratchet_decrypt(args),
         "dm_session_open_initiator" => dm_session_open_initiator(args),
         "dm_session_open_responder" => dm_session_open_responder(args),
-        "pad_message" => pad_message_ffi(args),
-        "unpad_message" => unpad_message_ffi(args),
-        method if method.starts_with("mls_") => {
+        method
+            if method.starts_with("mls_")
+                || matches!(
+                    method,
+                    "e2ee_attachment_encode" | "e2ee_attachment_decode"
+                ) =>
+        {
             match crate::mls::commands::dispatch(method, args) {
                 Ok(value) => ok(value),
                 Err(error) => err(error),
@@ -138,19 +141,6 @@ fn x3dh_resp(args: &Value) -> String {
     };
     match x3dh_responder(&bob_ik, &bob_spk, otk.as_ref(), &msg) {
         Ok(sk) => ok(json!({ "shared_secret_b64": B64.encode(sk.0) })),
-        Err(e) => err(e),
-    }
-}
-
-fn v1_decrypt(args: &Value) -> String {
-    let d = match B64.decode(args["private_d_b64"].as_str().unwrap_or("")) {
-        Ok(v) => v,
-        Err(e) => return err(e),
-    };
-    let my = args["my_spki_b64"].as_str().unwrap_or("");
-    let content = args["content_b64"].as_str().unwrap_or("");
-    match crate::v1_compat::decrypt_v1_text(&d, my, content) {
-        Ok(t) => ok(json!(t)),
         Err(e) => err(e),
     }
 }
@@ -325,26 +315,6 @@ fn dm_session_open_responder(args: &Value) -> String {
             }
             ok(out)
         }
-        Err(e) => err(e),
-    }
-}
-
-fn pad_message_ffi(args: &Value) -> String {
-    let mime = args["mime"].as_str().unwrap_or("text/plain");
-    let text = args["text"].as_str().unwrap_or("");
-    match crate::pad::pad_message(mime, text) {
-        Ok(b) => ok(json!({ "padded_b64": B64.encode(b) })),
-        Err(e) => err(e),
-    }
-}
-
-fn unpad_message_ffi(args: &Value) -> String {
-    let raw = match B64.decode(args["padded_b64"].as_str().unwrap_or("")) {
-        Ok(b) => b,
-        Err(e) => return err(e),
-    };
-    match crate::pad::unpad_message(&raw) {
-        Ok((m, c)) => ok(json!({ "mime": m, "text": c })),
         Err(e) => err(e),
     }
 }

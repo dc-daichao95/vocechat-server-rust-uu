@@ -5,6 +5,7 @@ mod api;
 mod api_key;
 mod config;
 mod create_user;
+mod e2ee_v2;
 mod license;
 mod middleware;
 mod mls_delivery;
