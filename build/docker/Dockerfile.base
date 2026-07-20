@@ -10,7 +10,10 @@
 FROM rust:1.95.0-bookworm AS builder
 WORKDIR /src
 COPY . .
-RUN cargo build --release \
+# Sparse index + locked build: host mirrors often break HTTP/2 crates.io fetches.
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
+    CARGO_HTTP_MULTIPLEXING=false
+RUN cargo build --locked --release \
  && cp target/release/vocechat-server /vocechat-server
 
 FROM debian:bookworm-slim
