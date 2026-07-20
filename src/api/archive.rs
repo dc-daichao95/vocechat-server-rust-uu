@@ -138,7 +138,10 @@ async fn internal_create_message_archive(
         };
 
         match merged_payload.content.content_type.as_str() {
-            "text/plain" | "text/markdown" => {
+            // Gen-2 E2E envelopes use application/vnd.vocechat.e2ee.v2.
+            // Favorites/forward archives may store the opaque ciphertext snapshot;
+            // clients that already decrypted the mid can render plaintext locally.
+            "text/plain" | "text/markdown" | crate::e2ee_v2::CONTENT_TYPE => {
                 archive.messages.push(ArchiveMessage {
                     from_user: user_idx,
                     created_at: merged_payload.created_at,
