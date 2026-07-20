@@ -1,0 +1,19 @@
+# Build the shared base image used by vocechat-server-e2ee (and other overlays).
+#
+# From repo root (vocechat-server-rust-uu):
+#   docker compose -f build/vocechat-server-base-compose.yml build
+#
+# Image: vocechat-server-base:latest
+# Dockerfile: build/docker/Dockerfile.base
+#
+# E2EE overlay (future):
+#   FROM vocechat-server-base:latest
+#
+# Build-only compose (no runtime services).
+
+services:
+  vocechat-server-base:
+    image: vocechat-server-base:latest
+    build:
+      context: ..
+      dockerfile: build/docker/Dockerfile.base

@@ -9,6 +9,18 @@
   - [`deploy/sing-box-reality/`](../../deploy/sing-box-reality/)
   - overlay: `docker compose -f build/docker/docker-compose.e2e.yml -f build/docker/docker-compose.reality.yml up -d`
 
+## Base image (`vocechat-server-base`)
+
+Shared runtime image for overlays such as `vocechat-server-e2ee`:
+
+```bash
+docker compose -f build/vocechat-server-base-compose.yml build
+# → vocechat-server-base:latest
+# Dockerfile: build/docker/Dockerfile.base
+```
+
+E2EE (or other) Dockerfiles should start with `FROM vocechat-server-base:latest`.
+
 ## Quick start
 
 ```bash
