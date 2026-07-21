@@ -38,10 +38,10 @@ use crate::{
         tags::ApiTags,
         token::{Token, TokenInQuery},
         BurnAfterReadingGroup, BurnAfterReadingUser, ChatMessage, ChatMessagePayload, CurrentUser,
-        DateTime, HeartbeatMessage, KickMessage, LangId, LoginConfig, Message, MessageTarget,
-        MuteGroup, MuteUser, ReadIndexGroup, ReadIndexUser, UpdateAction, User,
-        UserSettingsChangedMessage, UserSettingsMessage, UserStateChangedMessage, UserUpdateLog,
-        UsersUpdateLogMessage,
+        DateTime, E2eIdentityChangedMessage, E2ePendingEnvelopeAddedMessage, HeartbeatMessage,
+        KickMessage, LangId, LoginConfig, Message, MessageTarget, MuteGroup, MuteUser,
+        ReadIndexGroup, ReadIndexUser, UpdateAction, User, UserSettingsChangedMessage,
+        UserSettingsMessage, UserStateChangedMessage, UserUpdateLog, UsersUpdateLogMessage,
     },
     create_user::{CreateUser, CreateUserBy, CreateUserError},
     middleware::guest_forbidden,
@@ -1030,7 +1030,10 @@ impl ApiUser {
                 &token.device,
             )
             .map_err(|error| Error::from_string(error.to_string(), StatusCode::BAD_REQUEST))?;
-            if route.protocol != crate::e2ee_v2::Protocol::Dr {
+            if !matches!(
+                route.protocol,
+                crate::e2ee_v2::Protocol::Dr | crate::e2ee_v2::Protocol::DrPending
+            ) {
                 return Err(Error::from_status(StatusCode::BAD_REQUEST));
             }
         }
@@ -1993,6 +1996,32 @@ async fn events_loop(
                                     if tx_msg.send(msg).is_err() {
                                         break;
                                     }
+                                }
+                            }
+                            BroadcastEvent::E2eIdentityChanged { targets, uid, device_id, updated_at } => {
+                                if !targets.contains(&current_uid) {
+                                    continue;
+                                }
+                                let msg = Message::E2eIdentityChanged(E2eIdentityChangedMessage {
+                                    uid: *uid,
+                                    device_id: device_id.clone(),
+                                    updated_at: *updated_at,
+                                });
+                                if tx_msg.send(msg).is_err() {
+                                    break;
+                                }
+                            }
+                            BroadcastEvent::E2ePendingEnvelopeAdded { targets, mid, recipient_uid, device_id } => {
+                                if !targets.contains(&current_uid) {
+                                    continue;
+                                }
+                                let msg = Message::E2ePendingEnvelopeAdded(E2ePendingEnvelopeAddedMessage {
+                                    mid: *mid,
+                                    recipient_uid: *recipient_uid,
+                                    device_id: device_id.clone(),
+                                });
+                                if tx_msg.send(msg).is_err() {
+                                    break;
                                 }
                             }
                         }

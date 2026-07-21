@@ -38,10 +38,11 @@ pub use group::{Group, PinnedMessage};
 pub use langid::LangId;
 pub use message::{
     get_merged_message, BurnAfterReadingGroup, BurnAfterReadingUser, ChatMessage,
-    ChatMessagePayload, GroupChangedMessage, HeartbeatMessage, JoinedGroupMessage,
-    KickFromGroupMessage, KickFromGroupReason, KickMessage, KickReason, Message, MessageDetail,
-    MessageTarget, MessageTargetGroup, MessageTargetUser, MuteGroup, MuteUser, ReadIndexGroup,
-    ReadIndexUser, RelatedGroupsMessage, UserJoinedGroupMessage, UserLeavedGroupMessage,
+    ChatMessagePayload, E2eIdentityChangedMessage, E2ePendingEnvelopeAddedMessage,
+    GroupChangedMessage, HeartbeatMessage, JoinedGroupMessage, KickFromGroupMessage,
+    KickFromGroupReason, KickMessage, KickReason, Message, MessageDetail, MessageTarget,
+    MessageTargetGroup, MessageTargetUser, MuteGroup, MuteUser, ReadIndexGroup, ReadIndexUser,
+    RelatedGroupsMessage, UserJoinedGroupMessage, UserLeavedGroupMessage,
     UserSettingsChangedMessage, UserSettingsMessage, UserState, UserStateChangedMessage,
     UserUpdateLog, UsersStateMessage, UsersUpdateLogMessage,
 };

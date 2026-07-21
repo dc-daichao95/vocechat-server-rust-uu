@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use poem::{error::InternalServerError, http::StatusCode, web::Data, Error, Result};
 use poem_openapi::{
     param::{Path, Query},
@@ -9,6 +11,7 @@ use serde_json::{json, Value};
 
 use crate::{
     api::{tags::ApiTags, token::Token, DateTime, LoginConfig},
+    state::BroadcastEvent,
     State,
 };
 
@@ -100,6 +103,31 @@ struct PutE2eDmSettingRequest {
     e2e_enabled: bool,
 }
 
+/// A deferred DM (`protocol=dr-pending`) still awaiting a recipient-device
+/// key envelope.
+#[derive(Debug, Object, Serialize, Deserialize, Clone)]
+struct E2ePendingDmMessage {
+    mid: i64,
+    created_at: DateTime,
+}
+
+#[derive(Debug, Object)]
+struct AppendPendingEnvelopeRequest {
+    recipient_uid: i64,
+    device_id: String,
+    /// Opaque per-device key envelope (client-defined encoding).
+    envelope: String,
+}
+
+#[derive(Debug, Object)]
+struct PendingEnvelopeAck {
+    mid: i64,
+    recipient_uid: i64,
+    device_id: String,
+    /// True once at least one current recipient device has an envelope.
+    completed: bool,
+}
+
 /// Public E2E capability advertised to clients (no admin token required).
 #[derive(Debug, Object, Serialize, Deserialize, Clone)]
 struct E2eProtocolInfo {
@@ -157,6 +185,24 @@ impl ApiE2e {
         .execute(&state.db_pool)
         .await
         .map_err(InternalServerError)?;
+
+        // Notify senders with an incomplete deferred DM addressed to this uid
+        // so their online devices can catch up and append envelopes.
+        let waiting_senders = sqlx::query_scalar::<_, i64>(
+            "select distinct sender_uid from e2e_pending_message where target_uid = ? and completed_at is null",
+        )
+        .bind(token.uid)
+        .fetch_all(&state.db_pool)
+        .await
+        .map_err(InternalServerError)?;
+        if !waiting_senders.is_empty() {
+            let _ = state.event_sender.send(Arc::new(BroadcastEvent::E2eIdentityChanged {
+                targets: waiting_senders.into_iter().collect(),
+                uid: token.uid,
+                device_id: req.device_id.clone(),
+                updated_at: now,
+            }));
+        }
 
         Ok(Json(E2eIdentity {
             uid: token.uid,
@@ -505,6 +551,131 @@ impl ApiE2e {
         }))
     }
 
+    /// List this user's deferred (`dr-pending`) DM sends to `uid` that are
+    /// still awaiting a recipient-device key envelope.
+    #[oai(path = "/pending/:uid", method = "get")]
+    async fn get_pending(
+        &self,
+        state: Data<&State>,
+        token: Token,
+        uid: Path<i64>,
+    ) -> Result<Json<Vec<E2ePendingDmMessage>>> {
+        let rows = sqlx::query_as::<_, (i64, DateTime)>(
+            r#"
+            select mid, created_at from e2e_pending_message
+            where sender_uid = ? and target_uid = ? and completed_at is null
+            order by mid asc
+            "#,
+        )
+        .bind(token.uid)
+        .bind(uid.0)
+        .fetch_all(&state.db_pool)
+        .await
+        .map_err(InternalServerError)?;
+
+        Ok(Json(
+            rows.into_iter()
+                .map(|(mid, created_at)| E2ePendingDmMessage { mid, created_at })
+                .collect(),
+        ))
+    }
+
+    /// Append a per-device key envelope to a deferred DM. Only the original
+    /// sender may call this. `recipient_uid` must equal the original DM
+    /// target and `device_id` must be a published identity for that user.
+    #[oai(path = "/pending/:mid/envelope", method = "post")]
+    async fn post_pending_envelope(
+        &self,
+        state: Data<&State>,
+        token: Token,
+        mid: Path<i64>,
+        req: Json<AppendPendingEnvelopeRequest>,
+    ) -> Result<Json<PendingEnvelopeAck>> {
+        if req.device_id.is_empty() || req.envelope.is_empty() {
+            return Err(Error::from_status(StatusCode::BAD_REQUEST));
+        }
+
+        let (sender_uid, target_uid) = sqlx::query_as::<_, (i64, i64)>(
+            "select sender_uid, target_uid from e2e_pending_message where mid = ?",
+        )
+        .bind(mid.0)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(InternalServerError)?
+        .ok_or_else(|| Error::from_status(StatusCode::NOT_FOUND))?;
+
+        if sender_uid != token.uid {
+            return Err(Error::from_string(
+                "E2E_PENDING_FORBIDDEN",
+                StatusCode::FORBIDDEN,
+            ));
+        }
+        if req.recipient_uid != target_uid {
+            return Err(Error::from_string(
+                "E2E_PENDING_WRONG_RECIPIENT",
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+
+        let device_exists = sqlx::query_scalar::<_, i64>(
+            "select count(*) from e2e_identity where uid = ? and device_id = ?",
+        )
+        .bind(req.recipient_uid)
+        .bind(&req.device_id)
+        .fetch_one(&state.db_pool)
+        .await
+        .map_err(InternalServerError)?;
+        if device_exists == 0 {
+            return Err(Error::from_string(
+                "E2E_PENDING_UNKNOWN_DEVICE",
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+
+        let now = DateTime::now();
+        let mut tx = state.db_pool.begin().await.map_err(InternalServerError)?;
+        sqlx::query(
+            r#"
+            insert into e2e_pending_envelope (mid, recipient_uid, device_id, envelope, created_at)
+            values (?, ?, ?, ?, ?)
+            on conflict(mid, recipient_uid, device_id) do update set
+              envelope = excluded.envelope,
+              created_at = excluded.created_at
+            "#,
+        )
+        .bind(mid.0)
+        .bind(req.recipient_uid)
+        .bind(&req.device_id)
+        .bind(&req.envelope)
+        .bind(now)
+        .execute(&mut tx)
+        .await
+        .map_err(InternalServerError)?;
+
+        sqlx::query(
+            "update e2e_pending_message set completed_at = ? where mid = ? and completed_at is null",
+        )
+        .bind(now)
+        .bind(mid.0)
+        .execute(&mut tx)
+        .await
+        .map_err(InternalServerError)?;
+        tx.commit().await.map_err(InternalServerError)?;
+
+        let _ = state.event_sender.send(Arc::new(BroadcastEvent::E2ePendingEnvelopeAdded {
+            targets: [sender_uid, req.recipient_uid].into_iter().collect(),
+            mid: mid.0,
+            recipient_uid: req.recipient_uid,
+            device_id: req.device_id.clone(),
+        }));
+
+        Ok(Json(PendingEnvelopeAck {
+            mid: mid.0,
+            recipient_uid: req.0.recipient_uid,
+            device_id: req.0.device_id,
+            completed: true,
+        }))
+    }
 }
 
 /// Build webhook-safe body for E2E chat messages (no plaintext content).
@@ -529,6 +700,8 @@ pub fn redact_e2e_chat_message_json(message: &crate::api::ChatMessage) -> Option
         return None;
     }
 
+    // `ChatMessage` flattens its `payload` fields (mid, from_uid, target,
+    // detail, ...) into one JSON object; there is no nested "payload" key.
     let mut v: Value = serde_json::from_str(&message.to_json_string()).unwrap_or_else(|_| {
         json!({
             "mid": message.mid,
@@ -536,10 +709,8 @@ pub fn redact_e2e_chat_message_json(message: &crate::api::ChatMessage) -> Option
             "detail": { "type": "e2e_opaque" }
         })
     });
-    if let Some(payload) = v.get_mut("payload") {
-        if let Some(detail) = payload.get_mut("detail") {
-            *detail = json!({ "type": "e2e_opaque" });
-        }
+    if let Some(detail) = v.get_mut("detail") {
+        *detail = json!({ "type": "e2e_opaque" });
     }
     v["e2e"] = Value::Bool(true);
     Some(v.to_string())
@@ -547,9 +718,12 @@ pub fn redact_e2e_chat_message_json(message: &crate::api::ChatMessage) -> Option
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
 
-    use crate::test_harness::TestServer;
+    use crate::{
+        api::{redact_e2e_chat_message_json, DateTime},
+        test_harness::TestServer,
+    };
 
     #[tokio::test]
     async fn test_e2e_identity_roundtrip() {
@@ -684,5 +858,364 @@ mod tests {
             .send()
             .await
             .assert_status(poem::http::StatusCode::NOT_FOUND);
+    }
+
+    fn dr_pending_properties(sender_device_id: &str, local_id: &str) -> Value {
+        json!({
+            "e2e_version": 2,
+            "protocol": "dr-pending",
+            "wire_class": "dr_envelope",
+            "sender_device_id": sender_device_id,
+            "local_id": local_id,
+        })
+    }
+
+    async fn send_pending_dm(
+        server: &crate::test_harness::TestServer,
+        sender_token: &str,
+        sender_device_id: &str,
+        target_uid: i64,
+        local_id: &str,
+    ) -> i64 {
+        let resp = server
+            .post(format!("/api/user/{target_uid}/send"))
+            .header("X-API-Key", sender_token)
+            .header(
+                "X-Properties",
+                base64::encode(
+                    serde_json::to_string(&dr_pending_properties(sender_device_id, local_id))
+                        .unwrap(),
+                ),
+            )
+            .content_type(crate::e2ee_v2::CONTENT_TYPE)
+            .body("opaque-pending-envelope")
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        resp.json().await.value().i64()
+    }
+
+    async fn put_identity(
+        server: &crate::test_harness::TestServer,
+        token: &str,
+        device_id: &str,
+    ) {
+        server
+            .put("/api/user/e2e/identity")
+            .header("X-API-Key", token)
+            .body_json(&json!({
+                "device_id": device_id,
+                "identity_key_pub": format!("pk_{device_id}"),
+                "signed_prekey_pub": format!("spk_{device_id}"),
+                "signed_prekey_sig": format!("sig_{device_id}"),
+            }))
+            .send()
+            .await
+            .assert_status_is_ok();
+    }
+
+    #[tokio::test]
+    async fn test_pending_dm_rejects_group_target() {
+        use poem::http::StatusCode;
+
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin().await;
+        let gid = {
+            let resp = server
+                .post("/api/group")
+                .header("X-API-Key", &admin_token)
+                .body_json(&json!({"name": "g1", "description": "", "is_public": true, "members": []}))
+                .send()
+                .await;
+            resp.assert_status_is_ok();
+            resp.json().await.value().object().get("gid").i64()
+        };
+
+        let resp = server
+            .post(format!("/api/group/{gid}/send"))
+            .header("X-API-Key", &admin_token)
+            .header(
+                "X-Properties",
+                base64::encode(
+                    serde_json::to_string(&dr_pending_properties("device-admin", "l1")).unwrap(),
+                ),
+            )
+            .content_type(crate::e2ee_v2::CONTENT_TYPE)
+            .body("opaque")
+            .send()
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_pending_dm_send_lists_and_completes_on_envelope_append() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid1 = server.create_user(&admin_token, "pending1@voce.chat").await;
+        let token1 = server.login_with_device("pending1@voce.chat", "device-1").await;
+
+        let mid = send_pending_dm(&server, &admin_token, "device-admin", uid1, "local-pending-1").await;
+
+        let resp = server
+            .get(format!("/api/user/e2e/pending/{uid1}"))
+            .header("X-API-Key", &admin_token)
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let body = resp.json().await;
+        let arr = body.value().array();
+        assert!(arr.iter().any(|row| row.object().get("mid").i64() == mid));
+
+        put_identity(&server, &token1, "device-1").await;
+
+        let resp = server
+            .post(format!("/api/user/e2e/pending/{mid}/envelope"))
+            .header("X-API-Key", &admin_token)
+            .body_json(&json!({
+                "recipient_uid": uid1,
+                "device_id": "device-1",
+                "envelope": "wrapped-content-key",
+            }))
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let body = resp.json().await;
+        assert!(body.value().object().get("completed").bool());
+
+        let resp = server
+            .get(format!("/api/user/e2e/pending/{uid1}"))
+            .header("X-API-Key", &admin_token)
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let body = resp.json().await;
+        assert!(!body.value().array().iter().any(|row| row.object().get("mid").i64() == mid));
+    }
+
+    #[tokio::test]
+    async fn test_pending_envelope_rejects_wrong_sender() {
+        use poem::http::StatusCode;
+
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid1 = server.create_user(&admin_token, "pending2@voce.chat").await;
+        let token1 = server.login_with_device("pending2@voce.chat", "device-1").await;
+        let _uid_other = server.create_user(&admin_token, "pending2b@voce.chat").await;
+        let token_other = server.login_with_device("pending2b@voce.chat", "device-2").await;
+
+        let mid = send_pending_dm(&server, &admin_token, "device-admin", uid1, "local-pending-2").await;
+        put_identity(&server, &token1, "device-1").await;
+
+        let resp = server
+            .post(format!("/api/user/e2e/pending/{mid}/envelope"))
+            .header("X-API-Key", &token_other)
+            .body_json(&json!({
+                "recipient_uid": uid1,
+                "device_id": "device-1",
+                "envelope": "wrapped-content-key",
+            }))
+            .send()
+            .await;
+        resp.assert_status(StatusCode::FORBIDDEN);
+        resp.assert_text("E2E_PENDING_FORBIDDEN").await;
+    }
+
+    #[tokio::test]
+    async fn test_pending_envelope_rejects_wrong_recipient() {
+        use poem::http::StatusCode;
+
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid1 = server.create_user(&admin_token, "pending3@voce.chat").await;
+        let uid2 = server.create_user(&admin_token, "pending3b@voce.chat").await;
+
+        let mid = send_pending_dm(&server, &admin_token, "device-admin", uid1, "local-pending-3").await;
+
+        let resp = server
+            .post(format!("/api/user/e2e/pending/{mid}/envelope"))
+            .header("X-API-Key", &admin_token)
+            .body_json(&json!({
+                "recipient_uid": uid2,
+                "device_id": "device-x",
+                "envelope": "wrapped-content-key",
+            }))
+            .send()
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        resp.assert_text("E2E_PENDING_WRONG_RECIPIENT").await;
+    }
+
+    #[tokio::test]
+    async fn test_pending_envelope_rejects_unknown_device() {
+        use poem::http::StatusCode;
+
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid1 = server.create_user(&admin_token, "pending4@voce.chat").await;
+
+        let mid = send_pending_dm(&server, &admin_token, "device-admin", uid1, "local-pending-4").await;
+
+        let resp = server
+            .post(format!("/api/user/e2e/pending/{mid}/envelope"))
+            .header("X-API-Key", &admin_token)
+            .body_json(&json!({
+                "recipient_uid": uid1,
+                "device_id": "device-ghost",
+                "envelope": "wrapped-content-key",
+            }))
+            .send()
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        resp.assert_text("E2E_PENDING_UNKNOWN_DEVICE").await;
+    }
+
+    #[tokio::test]
+    async fn test_pending_envelope_not_found() {
+        use poem::http::StatusCode;
+
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin().await;
+
+        let resp = server
+            .post("/api/user/e2e/pending/9999999/envelope")
+            .header("X-API-Key", &admin_token)
+            .body_json(&json!({
+                "recipient_uid": 1,
+                "device_id": "device-x",
+                "envelope": "wrapped-content-key",
+            }))
+            .send()
+            .await;
+        resp.assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_pending_envelope_append_is_idempotent() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid1 = server.create_user(&admin_token, "pending5@voce.chat").await;
+        let token1 = server.login_with_device("pending5@voce.chat", "device-1").await;
+        put_identity(&server, &token1, "device-1").await;
+
+        let mid = send_pending_dm(&server, &admin_token, "device-admin", uid1, "local-pending-5").await;
+
+        for _ in 0..2 {
+            let resp = server
+                .post(format!("/api/user/e2e/pending/{mid}/envelope"))
+                .header("X-API-Key", &admin_token)
+                .body_json(&json!({
+                    "recipient_uid": uid1,
+                    "device_id": "device-1",
+                    "envelope": "wrapped-content-key",
+                }))
+                .send()
+                .await;
+            resp.assert_status_is_ok();
+        }
+
+        let count: i64 = sqlx::query_scalar(
+            "select count(*) from e2e_pending_envelope where mid = ? and recipient_uid = ? and device_id = ?",
+        )
+        .bind(mid)
+        .bind(uid1)
+        .bind("device-1")
+        .fetch_one(&server.state().db_pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_identity_publish_emits_event_to_waiting_sender() {
+        use futures_util::StreamExt;
+
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid1 = server.create_user(&admin_token, "pending6@voce.chat").await;
+        let token1 = server.login_with_device("pending6@voce.chat", "device-1").await;
+
+        let _mid = send_pending_dm(&server, &admin_token, "device-admin", uid1, "local-pending-6").await;
+
+        let mut events = server
+            .subscribe_events(&admin_token, Some(&["e2e_identity_changed"]))
+            .await;
+
+        put_identity(&server, &token1, "device-1").await;
+
+        let event = events.next().await.unwrap();
+        let event = event.value().object();
+        event.get("uid").assert_i64(uid1);
+        event.get("device_id").assert_string("device-1");
+    }
+
+    #[tokio::test]
+    async fn test_pending_envelope_added_emits_event_to_sender_and_recipient() {
+        use futures_util::StreamExt;
+
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid1 = server.create_user(&admin_token, "pending7@voce.chat").await;
+        let token1 = server.login_with_device("pending7@voce.chat", "device-1").await;
+        put_identity(&server, &token1, "device-1").await;
+
+        let mid = send_pending_dm(&server, &admin_token, "device-admin", uid1, "local-pending-7").await;
+
+        let sender_events = server
+            .subscribe_events(&admin_token, Some(&["e2e_pending_envelope_added"]))
+            .await;
+        let recipient_events = server
+            .subscribe_events(&token1, Some(&["e2e_pending_envelope_added"]))
+            .await;
+
+        server
+            .post(format!("/api/user/e2e/pending/{mid}/envelope"))
+            .header("X-API-Key", &admin_token)
+            .body_json(&json!({
+                "recipient_uid": uid1,
+                "device_id": "device-1",
+                "envelope": "wrapped-content-key",
+            }))
+            .send()
+            .await
+            .assert_status_is_ok();
+
+        for mut events in [sender_events, recipient_events] {
+            let event = events.next().await.unwrap();
+            let event = event.value().object();
+            event.get("mid").assert_i64(mid);
+            event.get("recipient_uid").assert_i64(uid1);
+            event.get("device_id").assert_string("device-1");
+        }
+    }
+
+    #[test]
+    fn test_pending_dm_message_webhook_redaction_stays_opaque() {
+        use crate::api::message::{
+            ChatMessagePayload, MessageDetail, MessageNormal, MessageTarget, MessageTargetUser,
+        };
+
+        let payload = ChatMessagePayload {
+            from_uid: 1,
+            created_at: DateTime::now(),
+            target: MessageTarget::User(MessageTargetUser { uid: 2 }),
+            detail: MessageDetail::Normal(MessageNormal {
+                content: crate::api::message::ChatMessageContent {
+                    properties: Some(
+                        serde_json::from_value(dr_pending_properties("device-a", "local-1"))
+                            .unwrap(),
+                    ),
+                    content_type: crate::e2ee_v2::CONTENT_TYPE.to_owned(),
+                    content: "opaque-ciphertext".to_owned(),
+                },
+                expires_in: None,
+            }),
+        };
+        let message = crate::api::ChatMessage { mid: 42, payload };
+
+        let redacted = redact_e2e_chat_message_json(&message).expect("should redact e2e message");
+        let value: Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(value["e2e"], json!(true));
+        assert_eq!(value["detail"], json!({"type": "e2e_opaque"}));
+        assert!(!redacted.contains("opaque-ciphertext"));
     }
 }

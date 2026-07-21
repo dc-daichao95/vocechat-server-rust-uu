@@ -3,11 +3,17 @@ use std::{collections::HashMap, fmt};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
+use crate::api::DateTime;
+
 pub const CONTENT_TYPE: &str = "application/vnd.vocechat.e2ee.v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Protocol {
     Dr,
+    /// Deferred DM: no recipient device existed at send time. Server stores
+    /// the opaque canonical message plus pending metadata; recipient-device
+    /// envelopes are appended later via the pending-envelope API.
+    DrPending,
     Mls,
 }
 
@@ -207,6 +213,30 @@ pub async fn reserve_mls_sequence(
     tx.commit().await.map_err(MlsSequenceError::Database)
 }
 
+/// Record deferred-DM pending metadata for a canonical message that was just
+/// persisted (send_to_dm). Idempotent on `mid` so retried sends do not error.
+pub async fn insert_pending_dm(
+    pool: &SqlitePool,
+    mid: i64,
+    sender_uid: i64,
+    target_uid: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        insert into e2e_pending_message (mid, sender_uid, target_uid, created_at)
+        values (?, ?, ?, ?)
+        on conflict(mid) do nothing
+        "#,
+    )
+    .bind(mid)
+    .bind(sender_uid)
+    .bind(target_uid)
+    .bind(DateTime::now())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub fn validate_properties(
     properties: &HashMap<String, Value>,
 ) -> Result<RoutingProperties, E2eV2Error> {
@@ -216,6 +246,7 @@ pub fn validate_properties(
 
     let protocol = match properties.get("protocol").and_then(Value::as_str) {
         Some("dr") => Protocol::Dr,
+        Some("dr-pending") => Protocol::DrPending,
         Some("mls") => Protocol::Mls,
         _ => return Err(E2eV2Error::InvalidProperty("protocol")),
     };
@@ -227,7 +258,7 @@ pub fn validate_properties(
     };
     if !matches!(
         (protocol, wire_class),
-        (Protocol::Dr, WireClass::DrEnvelope)
+        (Protocol::Dr | Protocol::DrPending, WireClass::DrEnvelope)
             | (
                 Protocol::Mls,
                 WireClass::MlsHandshake | WireClass::MlsApplication
@@ -284,6 +315,18 @@ pub fn validate_properties(
         }
         (Protocol::Dr, WireClass::DrEnvelope)
             if mls_epoch.is_some()
+                || mls_generation.is_some()
+                || mls_handshake_kind.is_some()
+                || mls_commit_id.is_some() =>
+        {
+            return Err(E2eV2Error::ProtocolMismatch);
+        }
+        // Deferred DM: no recipient device exists yet, so no single
+        // recipient_device_id is carried; per-device envelopes are appended
+        // later out-of-band via the pending-envelope API.
+        (Protocol::DrPending, WireClass::DrEnvelope)
+            if recipient_device_id.is_some()
+                || mls_epoch.is_some()
                 || mls_generation.is_some()
                 || mls_handshake_kind.is_some()
                 || mls_commit_id.is_some() =>
@@ -377,6 +420,32 @@ mod tests {
             .unwrap();
             assert_eq!(route.protocol, Protocol::Mls);
             assert_eq!(route.mls_epoch, Some(7));
+        }
+    }
+
+    #[test]
+    fn accepts_dr_pending_envelope_without_recipient_device() {
+        let route = validate_properties(&props(json!({
+            "e2e_version": 2,
+            "protocol": "dr-pending",
+            "wire_class": "dr_envelope",
+            "sender_device_id": "device-a",
+            "local_id": "018f8dd2-c87e-7b40-bf45-4df46c08e591"
+        })))
+        .unwrap();
+        assert_eq!(route.protocol, Protocol::DrPending);
+        assert_eq!(route.wire_class, WireClass::DrEnvelope);
+        assert_eq!(route.recipient_device_id, None);
+    }
+
+    #[test]
+    fn rejects_dr_pending_with_recipient_device_or_mls_fields() {
+        for value in [
+            json!({"e2e_version":2,"protocol":"dr-pending","wire_class":"dr_envelope","sender_device_id":"a","recipient_device_id":"b","local_id":"c"}),
+            json!({"e2e_version":2,"protocol":"dr-pending","wire_class":"dr_envelope","sender_device_id":"a","local_id":"c","mls_epoch":0}),
+            json!({"e2e_version":2,"protocol":"dr-pending","wire_class":"mls_application","sender_device_id":"a","local_id":"c"}),
+        ] {
+            assert!(validate_properties(&props(value)).is_err());
         }
     }
 

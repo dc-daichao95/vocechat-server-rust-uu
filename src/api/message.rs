@@ -420,6 +420,26 @@ pub struct GroupChangedMessage {
     pub e2e_enabled: Option<bool>,
 }
 
+/// E2E identity published or rotated for a device (deferred-DM catch-up
+/// signal). Sent only to users who have an incomplete deferred DM addressed
+/// to `uid`.
+#[derive(Debug, Object, Clone)]
+pub struct E2eIdentityChangedMessage {
+    pub uid: i64,
+    pub device_id: String,
+    pub updated_at: DateTime,
+}
+
+/// A per-device key envelope was appended to a deferred DM. Sent to the
+/// original sender (to mark the DM as sent) and the recipient (whose device
+/// can now decrypt it).
+#[derive(Debug, Object, Clone)]
+pub struct E2ePendingEnvelopeAddedMessage {
+    pub mid: i64,
+    pub recipient_uid: i64,
+    pub device_id: String,
+}
+
 /// Pinned message updated
 #[derive(Debug, Object, Clone)]
 pub struct PinnedMessageUpdated {
@@ -543,6 +563,10 @@ pub enum Message {
     GroupChanged(GroupChangedMessage),
     #[oai(mapping = "pinned_message_updated")]
     PinnedMessageUpdated(PinnedMessageUpdated),
+    #[oai(mapping = "e2e_identity_changed")]
+    E2eIdentityChanged(E2eIdentityChangedMessage),
+    #[oai(mapping = "e2e_pending_envelope_added")]
+    E2ePendingEnvelopeAdded(E2ePendingEnvelopeAddedMessage),
     #[oai(mapping = "heartbeat")]
     Heartbeat(HeartbeatMessage),
 }
@@ -922,7 +946,10 @@ async fn enforce_e2e_required(state: &State, payload: &ChatMessagePayload) -> po
     Ok(())
 }
 
-fn enforce_e2e_v2_target_protocol(payload: &ChatMessagePayload) -> poem::Result<()> {
+/// Validates that the E2EE v2 protocol matches the message target, and
+/// returns the DM target uid when this is a deferred (`dr-pending`) send so
+/// the caller can persist pending metadata once the canonical mid is known.
+fn enforce_e2e_v2_target_protocol(payload: &ChatMessagePayload) -> poem::Result<Option<i64>> {
     let content = match &payload.detail {
         MessageDetail::Normal(MessageNormal { content, .. })
         | MessageDetail::Reply(MessageReply { content, .. }) => Some(content),
@@ -932,10 +959,10 @@ fn enforce_e2e_v2_target_protocol(payload: &ChatMessagePayload) -> poem::Result<
         },
     };
     let Some(content) = content else {
-        return Ok(());
+        return Ok(None);
     };
     if content.content_type != crate::e2ee_v2::CONTENT_TYPE {
-        return Ok(());
+        return Ok(None);
     }
 
     let properties = content
@@ -943,21 +970,21 @@ fn enforce_e2e_v2_target_protocol(payload: &ChatMessagePayload) -> poem::Result<
         .as_ref()
         .ok_or_else(|| Error::from_status(StatusCode::BAD_REQUEST))?;
     let routing = crate::e2ee_v2::validate_properties(properties).map_err(BadRequest)?;
-    if !matches!(
-        (payload.target, routing.protocol),
+    match (payload.target, routing.protocol) {
+        (MessageTarget::User(MessageTargetUser { uid }), crate::e2ee_v2::Protocol::DrPending) => {
+            Ok(Some(uid))
+        }
         (MessageTarget::User(_), crate::e2ee_v2::Protocol::Dr)
-            | (MessageTarget::Group(_), crate::e2ee_v2::Protocol::Mls)
-    ) {
-        return Err(Error::from_string(
+        | (MessageTarget::Group(_), crate::e2ee_v2::Protocol::Mls) => Ok(None),
+        _ => Err(Error::from_string(
             "E2E_PROTOCOL_TARGET_MISMATCH",
             StatusCode::BAD_REQUEST,
-        ));
+        )),
     }
-    Ok(())
 }
 
 pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poem::Result<i64> {
-    enforce_e2e_v2_target_protocol(&payload)?;
+    let pending_dm_target = enforce_e2e_v2_target_protocol(&payload)?;
     enforce_e2e_required(state, &payload).await?;
 
     let cache = state.cache.read().await;
@@ -1140,6 +1167,12 @@ pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poe
         }
     };
 
+    if let Some(target_uid) = pending_dm_target {
+        crate::e2ee_v2::insert_pending_dm(&state.db_pool, mid, from_uid, target_uid)
+            .await
+            .map_err(InternalServerError)?;
+    }
+
     Ok(mid)
 }
 
@@ -1206,7 +1239,49 @@ pub fn get_merged_message(db: &MsgDb, mid: i64) -> poem::Result<Option<MergedMes
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+
+    fn e2e_v2_payload(target: MessageTarget, protocol: &str) -> ChatMessagePayload {
+        let mut properties = HashMap::new();
+        properties.insert("e2e_version".to_string(), json!(2));
+        properties.insert("protocol".to_string(), json!(protocol));
+        properties.insert("wire_class".to_string(), json!("dr_envelope"));
+        properties.insert("sender_device_id".to_string(), json!("device-a"));
+        properties.insert("local_id".to_string(), json!("local-1"));
+        if protocol == "dr" {
+            properties.insert("recipient_device_id".to_string(), json!("device-b"));
+        }
+        ChatMessagePayload {
+            from_uid: 1,
+            created_at: DateTime::now(),
+            target,
+            detail: MessageDetail::Normal(MessageNormal {
+                content: ChatMessageContent {
+                    properties: Some(properties),
+                    content_type: crate::e2ee_v2::CONTENT_TYPE.to_string(),
+                    content: "opaque".to_string(),
+                },
+                expires_in: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn dr_pending_allowed_only_for_dm_target() {
+        let dm = e2e_v2_payload(MessageTarget::user(2), "dr-pending");
+        assert_eq!(enforce_e2e_v2_target_protocol(&dm).unwrap(), Some(2));
+
+        let group = e2e_v2_payload(MessageTarget::group(9), "dr-pending");
+        assert!(enforce_e2e_v2_target_protocol(&group).is_err());
+    }
+
+    #[test]
+    fn dr_and_mls_do_not_report_a_pending_dm_target() {
+        let dm = e2e_v2_payload(MessageTarget::user(2), "dr");
+        assert_eq!(enforce_e2e_v2_target_protocol(&dm).unwrap(), None);
+    }
 
     fn check_like_emoji(s: &str, r: bool) {
         assert_eq!(

@@ -271,6 +271,22 @@ pub enum BroadcastEvent {
         mid: i64,
         msg: Option<PinnedMessage>,
     },
+    /// E2E identity published/rotated (deferred-DM catch-up signal).
+    /// `targets` is the set of senders with an incomplete deferred DM to `uid`.
+    E2eIdentityChanged {
+        targets: BTreeSet<i64>,
+        uid: i64,
+        device_id: String,
+        updated_at: DateTime,
+    },
+    /// Deferred-DM pending envelope appended for a recipient device.
+    /// `targets` is the sender (sent confirmation) and the recipient (new key available).
+    E2ePendingEnvelopeAdded {
+        targets: BTreeSet<i64>,
+        mid: i64,
+        recipient_uid: i64,
+        device_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
