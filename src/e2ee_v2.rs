@@ -250,6 +250,11 @@ pub fn validate_properties(
         Some("mls") => Protocol::Mls,
         _ => return Err(E2eV2Error::InvalidProperty("protocol")),
     };
+    if protocol == Protocol::DrPending
+        && properties.get("algorithm").and_then(Value::as_str) != Some("DEFERRED+AES-GCM")
+    {
+        return Err(E2eV2Error::InvalidProperty("algorithm"));
+    }
     let wire_class = match properties.get("wire_class").and_then(Value::as_str) {
         Some("dr_envelope") => WireClass::DrEnvelope,
         Some("mls_handshake") => WireClass::MlsHandshake,
@@ -428,6 +433,7 @@ mod tests {
         let route = validate_properties(&props(json!({
             "e2e_version": 2,
             "protocol": "dr-pending",
+            "algorithm": "DEFERRED+AES-GCM",
             "wire_class": "dr_envelope",
             "sender_device_id": "device-a",
             "local_id": "018f8dd2-c87e-7b40-bf45-4df46c08e591"
@@ -441,9 +447,9 @@ mod tests {
     #[test]
     fn rejects_dr_pending_with_recipient_device_or_mls_fields() {
         for value in [
-            json!({"e2e_version":2,"protocol":"dr-pending","wire_class":"dr_envelope","sender_device_id":"a","recipient_device_id":"b","local_id":"c"}),
-            json!({"e2e_version":2,"protocol":"dr-pending","wire_class":"dr_envelope","sender_device_id":"a","local_id":"c","mls_epoch":0}),
-            json!({"e2e_version":2,"protocol":"dr-pending","wire_class":"mls_application","sender_device_id":"a","local_id":"c"}),
+            json!({"e2e_version":2,"protocol":"dr-pending","algorithm":"DEFERRED+AES-GCM","wire_class":"dr_envelope","sender_device_id":"a","recipient_device_id":"b","local_id":"c"}),
+            json!({"e2e_version":2,"protocol":"dr-pending","algorithm":"DEFERRED+AES-GCM","wire_class":"dr_envelope","sender_device_id":"a","local_id":"c","mls_epoch":0}),
+            json!({"e2e_version":2,"protocol":"dr-pending","algorithm":"DEFERRED+AES-GCM","wire_class":"mls_application","sender_device_id":"a","local_id":"c"}),
         ] {
             assert!(validate_properties(&props(value)).is_err());
         }

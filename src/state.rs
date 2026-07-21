@@ -286,6 +286,7 @@ pub enum BroadcastEvent {
         mid: i64,
         recipient_uid: i64,
         device_id: String,
+        envelope: String,
     },
 }
 

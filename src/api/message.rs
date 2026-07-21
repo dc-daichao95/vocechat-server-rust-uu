@@ -438,6 +438,8 @@ pub struct E2ePendingEnvelopeAddedMessage {
     pub mid: i64,
     pub recipient_uid: i64,
     pub device_id: String,
+    /// Opaque wrapped content key for `device_id`.
+    pub envelope: String,
 }
 
 /// Pinned message updated
@@ -773,11 +775,18 @@ enum InternalSendMessageTarget {
     Dm { from_uid: i64, to_uid: i64 },
 }
 
+struct InternalSendMessageResult {
+    mid: i64,
+    targets: Vec<i64>,
+    payload: ChatMessagePayload,
+    merged_id: Option<i64>,
+}
+
 fn internal_send_message(
     state: &State,
     target: InternalSendMessageTarget,
     payload: ChatMessagePayload,
-) -> poem::Result<i64> {
+) -> poem::Result<InternalSendMessageResult> {
     let (msg_id, targets) = match target {
         InternalSendMessageTarget::Group { gid, targets } => {
             // send message to group
@@ -871,19 +880,12 @@ fn internal_send_message(
         }
     };
 
-    // broadcast message
-    let _ = state.event_sender.send(Arc::new(BroadcastEvent::Chat {
-        targets: targets.into_iter().collect(),
-        message: ChatMessage {
-            mid: msg_id,
-            payload,
-        },
-    }));
-
-    if let Some(merged_id) = merged_id {
-        let _ = state.msg_updated_channel.send(merged_id);
-    }
-    Ok(msg_id)
+    Ok(InternalSendMessageResult {
+        mid: msg_id,
+        targets,
+        payload,
+        merged_id,
+    })
 }
 
 /// When a DM/channel session has E2E enabled, reject non-E2EE chat bodies.
@@ -1029,7 +1031,7 @@ pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poe
 
     // do send
     let from_uid = payload.from_uid;
-    let mid = match payload.target {
+    let result = match payload.target {
         MessageTarget::User(MessageTargetUser { uid }) => {
             // send notify
             if let Some(user) = cache.users.get(&payload.from_uid) {
@@ -1168,9 +1170,21 @@ pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poe
     };
 
     if let Some(target_uid) = pending_dm_target {
-        crate::e2ee_v2::insert_pending_dm(&state.db_pool, mid, from_uid, target_uid)
+        crate::e2ee_v2::insert_pending_dm(&state.db_pool, result.mid, from_uid, target_uid)
             .await
             .map_err(InternalServerError)?;
+    }
+
+    let mid = result.mid;
+    let _ = state.event_sender.send(Arc::new(BroadcastEvent::Chat {
+        targets: result.targets.into_iter().collect(),
+        message: ChatMessage {
+            mid,
+            payload: result.payload,
+        },
+    }));
+    if let Some(merged_id) = result.merged_id {
+        let _ = state.msg_updated_channel.send(merged_id);
     }
 
     Ok(mid)
@@ -1252,6 +1266,8 @@ mod tests {
         properties.insert("local_id".to_string(), json!("local-1"));
         if protocol == "dr" {
             properties.insert("recipient_device_id".to_string(), json!("device-b"));
+        } else if protocol == "dr-pending" {
+            properties.insert("algorithm".to_string(), json!("DEFERRED+AES-GCM"));
         }
         ChatMessagePayload {
             from_uid: 1,

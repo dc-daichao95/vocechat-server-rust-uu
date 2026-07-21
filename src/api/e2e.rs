@@ -186,12 +186,23 @@ impl ApiE2e {
         .await
         .map_err(InternalServerError)?;
 
-        // Notify senders with an incomplete deferred DM addressed to this uid
-        // so their online devices can catch up and append envelopes.
+        // Notify senders with a deferred DM that lacks an envelope for this
+        // device so future recipient devices can catch up too.
         let waiting_senders = sqlx::query_scalar::<_, i64>(
-            "select distinct sender_uid from e2e_pending_message where target_uid = ? and completed_at is null",
+            r#"
+            select distinct pending.sender_uid
+            from e2e_pending_message pending
+            where pending.target_uid = ?
+              and not exists (
+                select 1 from e2e_pending_envelope envelope
+                where envelope.mid = pending.mid
+                  and envelope.recipient_uid = pending.target_uid
+                  and envelope.device_id = ?
+              )
+            "#,
         )
         .bind(token.uid)
+        .bind(&req.device_id)
         .fetch_all(&state.db_pool)
         .await
         .map_err(InternalServerError)?;
@@ -552,7 +563,7 @@ impl ApiE2e {
     }
 
     /// List this user's deferred (`dr-pending`) DM sends to `uid` that are
-    /// still awaiting a recipient-device key envelope.
+    /// still awaiting an envelope for at least one current recipient device.
     #[oai(path = "/pending/:uid", method = "get")]
     async fn get_pending(
         &self,
@@ -562,9 +573,24 @@ impl ApiE2e {
     ) -> Result<Json<Vec<E2ePendingDmMessage>>> {
         let rows = sqlx::query_as::<_, (i64, DateTime)>(
             r#"
-            select mid, created_at from e2e_pending_message
-            where sender_uid = ? and target_uid = ? and completed_at is null
-            order by mid asc
+            select pending.mid, pending.created_at
+            from e2e_pending_message pending
+            where pending.sender_uid = ? and pending.target_uid = ?
+              and (
+                pending.completed_at is null
+                or exists (
+                    select 1
+                    from e2e_identity identity
+                    where identity.uid = pending.target_uid
+                      and not exists (
+                        select 1 from e2e_pending_envelope envelope
+                        where envelope.mid = pending.mid
+                          and envelope.recipient_uid = identity.uid
+                          and envelope.device_id = identity.device_id
+                      )
+                )
+              )
+            order by pending.mid asc
             "#,
         )
         .bind(token.uid)
@@ -634,13 +660,11 @@ impl ApiE2e {
 
         let now = DateTime::now();
         let mut tx = state.db_pool.begin().await.map_err(InternalServerError)?;
-        sqlx::query(
+        let insert_result = sqlx::query(
             r#"
             insert into e2e_pending_envelope (mid, recipient_uid, device_id, envelope, created_at)
             values (?, ?, ?, ?, ?)
-            on conflict(mid, recipient_uid, device_id) do update set
-              envelope = excluded.envelope,
-              created_at = excluded.created_at
+            on conflict(mid, recipient_uid, device_id) do nothing
             "#,
         )
         .bind(mid.0)
@@ -651,23 +675,29 @@ impl ApiE2e {
         .execute(&mut tx)
         .await
         .map_err(InternalServerError)?;
+        let envelope_added = insert_result.rows_affected() != 0;
 
-        sqlx::query(
-            "update e2e_pending_message set completed_at = ? where mid = ? and completed_at is null",
-        )
-        .bind(now)
-        .bind(mid.0)
-        .execute(&mut tx)
-        .await
-        .map_err(InternalServerError)?;
+        if envelope_added {
+            sqlx::query(
+                "update e2e_pending_message set completed_at = ? where mid = ? and completed_at is null",
+            )
+            .bind(now)
+            .bind(mid.0)
+            .execute(&mut tx)
+            .await
+            .map_err(InternalServerError)?;
+        }
         tx.commit().await.map_err(InternalServerError)?;
 
-        let _ = state.event_sender.send(Arc::new(BroadcastEvent::E2ePendingEnvelopeAdded {
-            targets: [sender_uid, req.recipient_uid].into_iter().collect(),
-            mid: mid.0,
-            recipient_uid: req.recipient_uid,
-            device_id: req.device_id.clone(),
-        }));
+        if envelope_added {
+            let _ = state.event_sender.send(Arc::new(BroadcastEvent::E2ePendingEnvelopeAdded {
+                targets: [sender_uid, req.recipient_uid].into_iter().collect(),
+                mid: mid.0,
+                recipient_uid: req.recipient_uid,
+                device_id: req.device_id.clone(),
+                envelope: req.envelope.clone(),
+            }));
+        }
 
         Ok(Json(PendingEnvelopeAck {
             mid: mid.0,
@@ -864,6 +894,7 @@ mod tests {
         json!({
             "e2e_version": 2,
             "protocol": "dr-pending",
+            "algorithm": "DEFERRED+AES-GCM",
             "wire_class": "dr_envelope",
             "sender_device_id": sender_device_id,
             "local_id": local_id,
@@ -939,6 +970,32 @@ mod tests {
                 base64::encode(
                     serde_json::to_string(&dr_pending_properties("device-admin", "l1")).unwrap(),
                 ),
+            )
+            .content_type(crate::e2ee_v2::CONTENT_TYPE)
+            .body("opaque")
+            .send()
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_pending_dm_rejects_wrong_algorithm() {
+        use poem::http::StatusCode;
+
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid1 = server
+            .create_user(&admin_token, "pending_algorithm@voce.chat")
+            .await;
+        let mut properties = dr_pending_properties("device-admin", "local-pending-algorithm");
+        properties["algorithm"] = json!("AES-GCM");
+
+        let resp = server
+            .post(format!("/api/user/{uid1}/send"))
+            .header("X-API-Key", &admin_token)
+            .header(
+                "X-Properties",
+                base64::encode(serde_json::to_string(&properties).unwrap()),
             )
             .content_type(crate::e2ee_v2::CONTENT_TYPE)
             .body("opaque")
@@ -1099,22 +1156,25 @@ mod tests {
 
         let mid = send_pending_dm(&server, &admin_token, "device-admin", uid1, "local-pending-5").await;
 
-        for _ in 0..2 {
+        for envelope in ["wrapped-content-key", "must-not-replace-existing-envelope"] {
             let resp = server
                 .post(format!("/api/user/e2e/pending/{mid}/envelope"))
                 .header("X-API-Key", &admin_token)
                 .body_json(&json!({
                     "recipient_uid": uid1,
                     "device_id": "device-1",
-                    "envelope": "wrapped-content-key",
+                    "envelope": envelope,
                 }))
                 .send()
                 .await;
             resp.assert_status_is_ok();
         }
 
-        let count: i64 = sqlx::query_scalar(
-            "select count(*) from e2e_pending_envelope where mid = ? and recipient_uid = ? and device_id = ?",
+        let (count, envelope): (i64, String) = sqlx::query_as(
+            r#"
+            select count(*), min(envelope) from e2e_pending_envelope
+            where mid = ? and recipient_uid = ? and device_id = ?
+            "#,
         )
         .bind(mid)
         .bind(uid1)
@@ -1123,6 +1183,103 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+        assert_eq!(envelope, "wrapped-content-key");
+    }
+
+    #[tokio::test]
+    async fn test_completed_pending_dm_is_listed_again_for_future_device() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid1 = server
+            .create_user(&admin_token, "pending_future_device@voce.chat")
+            .await;
+        let token1 = server
+            .login_with_device("pending_future_device@voce.chat", "device-1")
+            .await;
+        put_identity(&server, &token1, "device-1").await;
+
+        let mid = send_pending_dm(
+            &server,
+            &admin_token,
+            "device-admin",
+            uid1,
+            "local-pending-future-device",
+        )
+        .await;
+        server
+            .post(format!("/api/user/e2e/pending/{mid}/envelope"))
+            .header("X-API-Key", &admin_token)
+            .body_json(&json!({
+                "recipient_uid": uid1,
+                "device_id": "device-1",
+                "envelope": "wrapped-content-key-1",
+            }))
+            .send()
+            .await
+            .assert_status_is_ok();
+
+        let token2 = server
+            .login_with_device("pending_future_device@voce.chat", "device-2")
+            .await;
+        put_identity(&server, &token2, "device-2").await;
+
+        let resp = server
+            .get(format!("/api/user/e2e/pending/{uid1}"))
+            .header("X-API-Key", &admin_token)
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        assert!(resp
+            .json()
+            .await
+            .value()
+            .array()
+            .iter()
+            .any(|row| row.object().get("mid").i64() == mid));
+    }
+
+    #[tokio::test]
+    async fn test_pending_migration_enforces_unique_device_envelope() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin().await;
+        let uid1 = server
+            .create_user(&admin_token, "pending_migration@voce.chat")
+            .await;
+        let now = DateTime::now();
+
+        sqlx::query(
+            "insert into e2e_pending_message (mid, sender_uid, target_uid, created_at) values (?, ?, ?, ?)",
+        )
+        .bind(9_000_001_i64)
+        .bind(uid1)
+        .bind(uid1)
+        .bind(now)
+        .execute(&server.state().db_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "insert into e2e_pending_envelope (mid, recipient_uid, device_id, envelope, created_at) values (?, ?, ?, ?, ?)",
+        )
+        .bind(9_000_001_i64)
+        .bind(uid1)
+        .bind("device-1")
+        .bind("first")
+        .bind(now)
+        .execute(&server.state().db_pool)
+        .await
+        .unwrap();
+
+        let duplicate = sqlx::query(
+            "insert into e2e_pending_envelope (mid, recipient_uid, device_id, envelope, created_at) values (?, ?, ?, ?, ?)",
+        )
+        .bind(9_000_001_i64)
+        .bind(uid1)
+        .bind("device-1")
+        .bind("second")
+        .bind(now)
+        .execute(&server.state().db_pool)
+        .await;
+        assert!(duplicate.is_err());
     }
 
     #[tokio::test]
@@ -1185,6 +1342,7 @@ mod tests {
             event.get("mid").assert_i64(mid);
             event.get("recipient_uid").assert_i64(uid1);
             event.get("device_id").assert_string("device-1");
+            event.get("envelope").assert_string("wrapped-content-key");
         }
     }
 

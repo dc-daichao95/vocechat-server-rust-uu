@@ -2011,15 +2011,24 @@ async fn events_loop(
                                     break;
                                 }
                             }
-                            BroadcastEvent::E2ePendingEnvelopeAdded { targets, mid, recipient_uid, device_id } => {
+                            BroadcastEvent::E2ePendingEnvelopeAdded {
+                                targets,
+                                mid,
+                                recipient_uid,
+                                device_id,
+                                envelope,
+                            } => {
                                 if !targets.contains(&current_uid) {
                                     continue;
                                 }
-                                let msg = Message::E2ePendingEnvelopeAdded(E2ePendingEnvelopeAddedMessage {
-                                    mid: *mid,
-                                    recipient_uid: *recipient_uid,
-                                    device_id: device_id.clone(),
-                                });
+                                let msg = Message::E2ePendingEnvelopeAdded(
+                                    E2ePendingEnvelopeAddedMessage {
+                                        mid: *mid,
+                                        recipient_uid: *recipient_uid,
+                                        device_id: device_id.clone(),
+                                        envelope: envelope.clone(),
+                                    },
+                                );
                                 if tx_msg.send(msg).is_err() {
                                     break;
                                 }
