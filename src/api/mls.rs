@@ -150,8 +150,6 @@ fn validate_route(route: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use crate::test_harness::TestServer;
 
     #[tokio::test]
@@ -253,7 +251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_invalid_device_and_unauthorized_route() {
+    async fn rejects_invalid_device() {
         let server = TestServer::new().await;
         let token = server.login_admin().await;
         let response = server
@@ -264,22 +262,40 @@ mod tests {
             .send()
             .await;
         assert!(!response.0.status().is_success());
+    }
 
-        let outsider_uid = server.create_user(&token, "outsider@voce.chat").await;
+    #[tokio::test]
+    async fn authenticated_user_can_get_public_route_but_not_private_nonmember() {
+        let server = TestServer::new().await;
+        let token = server.login_admin().await;
+        server.create_user(&token, "outsider@voce.chat").await;
         let outsider = server.login("outsider@voce.chat").await;
-        let group = sqlx::query(
+        let public_group = sqlx::query(
             "insert into `group` (name, owner, is_public) values ('public-mls-test', 1, true)",
         )
         .execute(&server.state().db_pool)
         .await
         .unwrap();
-        let gid = group.last_insert_rowid();
-        let response = server
-            .put(format!("/api/user/mls/group/{gid}/route"))
+        let public_gid = public_group.last_insert_rowid();
+        server
+            .put(format!("/api/user/mls/group/{public_gid}/route"))
             .header("X-API-Key", &outsider)
-            .body_json(&json!({ "uid": outsider_uid }))
             .send()
-            .await;
-        response.assert_status(poem::http::StatusCode::FORBIDDEN);
+            .await
+            .assert_status_is_ok();
+
+        let private_group = sqlx::query(
+            "insert into `group` (name, owner, is_public) values ('private-mls-test', 1, false)",
+        )
+        .execute(&server.state().db_pool)
+        .await
+        .unwrap();
+        let private_gid = private_group.last_insert_rowid();
+        server
+            .put(format!("/api/user/mls/group/{private_gid}/route"))
+            .header("X-API-Key", &outsider)
+            .send()
+            .await
+            .assert_status(poem::http::StatusCode::FORBIDDEN);
     }
 }

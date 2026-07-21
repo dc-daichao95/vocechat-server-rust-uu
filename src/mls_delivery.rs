@@ -107,7 +107,7 @@ pub async fn authorize_group(db: &SqlitePool, uid: i64, gid: i64) -> Result<()> 
     let allowed = sqlx::query_scalar::<_, bool>(
         "select exists(\
            select 1 from `group` g where g.gid = ? and \
-             (g.owner = ? or exists(\
+             (g.is_public = true or g.owner = ? or exists(\
                 select 1 from group_user gu where gu.gid = g.gid and gu.uid = ?\
              ))\
          )",
