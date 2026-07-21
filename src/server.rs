@@ -86,6 +86,7 @@ pub async fn create_state(config_path: &Path, config: Arc<Config>) -> Result<Sta
         "open message db."
     );
     let msg_db = MsgDb::open(config.system.msg_dir())?;
+    crate::e2ee_v2::reconcile_pending_dm_markers(&msg_db, &db_pool).await?;
 
     let (groups, users) = futures_util::try_join!(
         State::load_groups_cache(&msg_db, &db_pool),

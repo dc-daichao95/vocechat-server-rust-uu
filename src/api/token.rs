@@ -1302,6 +1302,15 @@ impl ApiToken {
             .execute(&mut tx)
             .await
             .map_err(InternalServerError)?;
+        sqlx::query(
+            "update e2e_identity set retired_at = ? where uid = ? and device_id = ? and retired_at is null",
+        )
+        .bind(DateTime::now())
+        .bind(token.uid)
+        .bind(&token.device)
+        .execute(&mut tx)
+        .await
+        .map_err(InternalServerError)?;
 
         // commit transaction
         tx.commit().await.map_err(InternalServerError)?;

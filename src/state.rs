@@ -277,6 +277,7 @@ pub enum BroadcastEvent {
         targets: BTreeSet<i64>,
         uid: i64,
         device_id: String,
+        identity_version: i64,
         updated_at: DateTime,
     },
     /// Deferred-DM pending envelope appended for a recipient device.
@@ -286,6 +287,7 @@ pub enum BroadcastEvent {
         mid: i64,
         recipient_uid: i64,
         device_id: String,
+        identity_version: i64,
         envelope: String,
     },
 }

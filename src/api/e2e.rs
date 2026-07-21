@@ -36,6 +36,7 @@ async fn e2e_protocol_ver(state: &State) -> i32 {
 pub struct E2eIdentity {
     pub uid: i64,
     pub device_id: String,
+    pub identity_version: i64,
     /// Base64url or hex-encoded public identity key (client-defined encoding)
     pub identity_key_pub: String,
     pub signed_prekey_pub: Option<String>,
@@ -124,6 +125,7 @@ struct PendingEnvelopeAck {
     mid: i64,
     recipient_uid: i64,
     device_id: String,
+    identity_version: i64,
     /// True once at least one current recipient device has an envelope.
     completed: bool,
 }
@@ -165,15 +167,40 @@ impl ApiE2e {
             }
         }
         let now = DateTime::now();
+        let mut tx = state.db_pool.begin().await.map_err(InternalServerError)?;
+        let sender_device_exists = sqlx::query_scalar::<_, i64>(
+            "select count(*) from device where uid = ? and device = ?",
+        )
+        .bind(token.uid)
+        .bind(&token.device)
+        .fetch_one(&mut tx)
+        .await
+        .map_err(InternalServerError)?;
+        if sender_device_exists == 0 {
+            return Err(Error::from_string(
+                "E2E_SENDER_DEVICE_REVOKED",
+                StatusCode::FORBIDDEN,
+            ));
+        }
         sqlx::query(
             r#"
-            insert into e2e_identity (uid, device_id, identity_key_pub, signed_prekey_pub, signed_prekey_sig, updated_at)
-            values (?, ?, ?, ?, ?, ?)
+            insert into e2e_identity
+              (uid, device_id, identity_key_pub, signed_prekey_pub,
+               signed_prekey_sig, updated_at, key_version, retired_at)
+            values (?, ?, ?, ?, ?, ?, 1, null)
             on conflict(uid, device_id) do update set
+              key_version = case
+                when e2e_identity.identity_key_pub is not excluded.identity_key_pub
+                  or e2e_identity.signed_prekey_pub is not excluded.signed_prekey_pub
+                  or e2e_identity.signed_prekey_sig is not excluded.signed_prekey_sig
+                then e2e_identity.key_version + 1
+                else e2e_identity.key_version
+              end,
               identity_key_pub = excluded.identity_key_pub,
               signed_prekey_pub = excluded.signed_prekey_pub,
               signed_prekey_sig = excluded.signed_prekey_sig,
-              updated_at = excluded.updated_at
+              updated_at = excluded.updated_at,
+              retired_at = null
             "#,
         )
         .bind(token.uid)
@@ -182,7 +209,15 @@ impl ApiE2e {
         .bind(&req.signed_prekey_pub)
         .bind(&req.signed_prekey_sig)
         .bind(now)
-        .execute(&state.db_pool)
+        .execute(&mut tx)
+        .await
+        .map_err(InternalServerError)?;
+        let identity_version = sqlx::query_scalar::<_, i64>(
+            "select key_version from e2e_identity where uid = ? and device_id = ?",
+        )
+        .bind(token.uid)
+        .bind(&req.device_id)
+        .fetch_one(&mut tx)
         .await
         .map_err(InternalServerError)?;
 
@@ -198,19 +233,23 @@ impl ApiE2e {
                 where envelope.mid = pending.mid
                   and envelope.recipient_uid = pending.target_uid
                   and envelope.device_id = ?
+                  and envelope.identity_version = ?
               )
             "#,
         )
         .bind(token.uid)
         .bind(&req.device_id)
-        .fetch_all(&state.db_pool)
+        .bind(identity_version)
+        .fetch_all(&mut tx)
         .await
         .map_err(InternalServerError)?;
+        tx.commit().await.map_err(InternalServerError)?;
         if !waiting_senders.is_empty() {
             let _ = state.event_sender.send(Arc::new(BroadcastEvent::E2eIdentityChanged {
                 targets: waiting_senders.into_iter().collect(),
                 uid: token.uid,
                 device_id: req.device_id.clone(),
+                identity_version,
                 updated_at: now,
             }));
         }
@@ -218,6 +257,7 @@ impl ApiE2e {
         Ok(Json(E2eIdentity {
             uid: token.uid,
             device_id: req.0.device_id,
+            identity_version,
             identity_key_pub: req.0.identity_key_pub,
             signed_prekey_pub: req.0.signed_prekey_pub,
             signed_prekey_sig: req.0.signed_prekey_sig,
@@ -257,13 +297,22 @@ impl ApiE2e {
             (
                 i64,
                 String,
+                i64,
                 String,
                 Option<String>,
                 Option<String>,
                 DateTime,
             ),
         >(
-            "select uid, device_id, identity_key_pub, signed_prekey_pub, signed_prekey_sig, updated_at from e2e_identity where uid = ?",
+            r#"
+            select identity.uid, identity.device_id, identity.key_version,
+                   identity.identity_key_pub, identity.signed_prekey_pub,
+                   identity.signed_prekey_sig, identity.updated_at
+            from e2e_identity identity
+            inner join device
+              on device.uid = identity.uid and device.device = identity.device_id
+            where identity.uid = ? and identity.retired_at is null
+            "#,
         )
         .bind(uid.0)
         .fetch_all(&state.db_pool)
@@ -276,6 +325,7 @@ impl ApiE2e {
                     |(
                         uid,
                         device_id,
+                        identity_version,
                         identity_key_pub,
                         signed_prekey_pub,
                         signed_prekey_sig,
@@ -283,6 +333,7 @@ impl ApiE2e {
                     )| E2eIdentity {
                         uid,
                         device_id,
+                        identity_version,
                         identity_key_pub,
                         signed_prekey_pub,
                         signed_prekey_sig,
@@ -571,6 +622,9 @@ impl ApiE2e {
         token: Token,
         uid: Path<i64>,
     ) -> Result<Json<Vec<E2ePendingDmMessage>>> {
+        crate::e2ee_v2::reconcile_pending_dm_markers(&state.msg_db, &state.db_pool)
+            .await
+            .map_err(InternalServerError)?;
         let rows = sqlx::query_as::<_, (i64, DateTime)>(
             r#"
             select pending.mid, pending.created_at
@@ -581,12 +635,17 @@ impl ApiE2e {
                 or exists (
                     select 1
                     from e2e_identity identity
+                    inner join device
+                      on device.uid = identity.uid
+                     and device.device = identity.device_id
                     where identity.uid = pending.target_uid
+                      and identity.retired_at is null
                       and not exists (
                         select 1 from e2e_pending_envelope envelope
                         where envelope.mid = pending.mid
                           and envelope.recipient_uid = identity.uid
                           and envelope.device_id = identity.device_id
+                          and envelope.identity_version = identity.key_version
                       )
                 )
               )
@@ -620,12 +679,31 @@ impl ApiE2e {
         if req.device_id.is_empty() || req.envelope.is_empty() {
             return Err(Error::from_status(StatusCode::BAD_REQUEST));
         }
+        crate::e2ee_v2::reconcile_pending_dm_markers(&state.msg_db, &state.db_pool)
+            .await
+            .map_err(InternalServerError)?;
+
+        let mut tx = state.db_pool.begin().await.map_err(InternalServerError)?;
+        let sender_device_exists = sqlx::query_scalar::<_, i64>(
+            "select count(*) from device where uid = ? and device = ?",
+        )
+        .bind(token.uid)
+        .bind(&token.device)
+        .fetch_one(&mut tx)
+        .await
+        .map_err(InternalServerError)?;
+        if sender_device_exists == 0 {
+            return Err(Error::from_string(
+                "E2E_SENDER_DEVICE_REVOKED",
+                StatusCode::FORBIDDEN,
+            ));
+        }
 
         let (sender_uid, target_uid) = sqlx::query_as::<_, (i64, i64)>(
             "select sender_uid, target_uid from e2e_pending_message where mid = ?",
         )
         .bind(mid.0)
-        .fetch_optional(&state.db_pool)
+        .fetch_optional(&mut tx)
         .await
         .map_err(InternalServerError)?
         .ok_or_else(|| Error::from_status(StatusCode::NOT_FOUND))?;
@@ -643,33 +721,41 @@ impl ApiE2e {
             ));
         }
 
-        let device_exists = sqlx::query_scalar::<_, i64>(
-            "select count(*) from e2e_identity where uid = ? and device_id = ?",
+        let identity_version = sqlx::query_scalar::<_, i64>(
+            r#"
+            select identity.key_version
+            from e2e_identity identity
+            inner join device
+              on device.uid = identity.uid and device.device = identity.device_id
+            where identity.uid = ? and identity.device_id = ?
+              and identity.retired_at is null
+            "#,
         )
         .bind(req.recipient_uid)
         .bind(&req.device_id)
-        .fetch_one(&state.db_pool)
+        .fetch_optional(&mut tx)
         .await
         .map_err(InternalServerError)?;
-        if device_exists == 0 {
-            return Err(Error::from_string(
+        let identity_version = identity_version.ok_or_else(|| {
+            Error::from_string(
                 "E2E_PENDING_UNKNOWN_DEVICE",
                 StatusCode::BAD_REQUEST,
-            ));
-        }
+            )
+        })?;
 
         let now = DateTime::now();
-        let mut tx = state.db_pool.begin().await.map_err(InternalServerError)?;
         let insert_result = sqlx::query(
             r#"
-            insert into e2e_pending_envelope (mid, recipient_uid, device_id, envelope, created_at)
-            values (?, ?, ?, ?, ?)
-            on conflict(mid, recipient_uid, device_id) do nothing
+            insert into e2e_pending_envelope
+              (mid, recipient_uid, device_id, identity_version, envelope, created_at)
+            values (?, ?, ?, ?, ?, ?)
+            on conflict(mid, recipient_uid, device_id, identity_version) do nothing
             "#,
         )
         .bind(mid.0)
         .bind(req.recipient_uid)
         .bind(&req.device_id)
+        .bind(identity_version)
         .bind(&req.envelope)
         .bind(now)
         .execute(&mut tx)
@@ -695,6 +781,7 @@ impl ApiE2e {
                 mid: mid.0,
                 recipient_uid: req.recipient_uid,
                 device_id: req.device_id.clone(),
+                identity_version,
                 envelope: req.envelope.clone(),
             }));
         }
@@ -703,6 +790,7 @@ impl ApiE2e {
             mid: mid.0,
             recipient_uid: req.0.recipient_uid,
             device_id: req.0.device_id,
+            identity_version,
             completed: true,
         }))
     }
@@ -1239,6 +1327,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_identity_rotation_requires_new_version_envelope() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin_with_device("device-admin").await;
+        let uid = server
+            .create_user(&admin_token, "pending_rotation@voce.chat")
+            .await;
+        let recipient_token = server
+            .login_with_device("pending_rotation@voce.chat", "device-1")
+            .await;
+        put_identity(&server, &recipient_token, "device-1").await;
+        let mid = send_pending_dm(
+            &server,
+            &admin_token,
+            "device-admin",
+            uid,
+            "local-pending-rotation",
+        )
+        .await;
+        server
+            .post(format!("/api/user/e2e/pending/{mid}/envelope"))
+            .header("X-API-Key", &admin_token)
+            .body_json(&json!({
+                "recipient_uid": uid,
+                "device_id": "device-1",
+                "envelope": "wrapped-v1",
+            }))
+            .send()
+            .await
+            .assert_status_is_ok();
+
+        let rotated = server
+            .put("/api/user/e2e/identity")
+            .header("X-API-Key", &recipient_token)
+            .body_json(&json!({
+                "device_id": "device-1",
+                "identity_key_pub": "pk-device-1-v2",
+                "signed_prekey_pub": "spk-device-1-v2",
+                "signed_prekey_sig": "sig-device-1-v2",
+            }))
+            .send()
+            .await;
+        rotated.assert_status_is_ok();
+        rotated
+            .json()
+            .await
+            .value()
+            .object()
+            .get("identity_version")
+            .assert_i64(2);
+
+        let pending = server
+            .get(format!("/api/user/e2e/pending/{uid}"))
+            .header("X-API-Key", &admin_token)
+            .send()
+            .await;
+        pending.assert_status_is_ok();
+        assert!(pending
+            .json()
+            .await
+            .value()
+            .array()
+            .iter()
+            .any(|row| row.object().get("mid").i64() == mid));
+
+        server
+            .post(format!("/api/user/e2e/pending/{mid}/envelope"))
+            .header("X-API-Key", &admin_token)
+            .body_json(&json!({
+                "recipient_uid": uid,
+                "device_id": "device-1",
+                "envelope": "wrapped-v2",
+            }))
+            .send()
+            .await
+            .assert_status_is_ok();
+        let envelopes: Vec<(i64, String)> = sqlx::query_as(
+            "select identity_version, envelope from e2e_pending_envelope where mid = ? order by identity_version",
+        )
+        .bind(mid)
+        .fetch_all(&server.state().db_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            envelopes,
+            vec![(1, "wrapped-v1".to_string()), (2, "wrapped-v2".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revoked_sender_device_cannot_append_envelope() {
+        use poem::http::StatusCode;
+
+        let server = TestServer::new().await;
+        let sender_token = server.login_admin_with_device("device-admin").await;
+        let uid = server
+            .create_user(&sender_token, "pending_revoked_sender@voce.chat")
+            .await;
+        let recipient_token = server
+            .login_with_device("pending_revoked_sender@voce.chat", "device-1")
+            .await;
+        put_identity(&server, &recipient_token, "device-1").await;
+        let mid = send_pending_dm(
+            &server,
+            &sender_token,
+            "device-admin",
+            uid,
+            "local-pending-revoked-sender",
+        )
+        .await;
+
+        server
+            .delete("/api/user/devices/device-admin")
+            .header("X-API-Key", &sender_token)
+            .send()
+            .await
+            .assert_status_is_ok();
+        let append = server
+            .post(format!("/api/user/e2e/pending/{mid}/envelope"))
+            .header("X-API-Key", &sender_token)
+            .body_json(&json!({
+                "recipient_uid": uid,
+                "device_id": "device-1",
+                "envelope": "wrapped",
+            }))
+            .send()
+            .await;
+        append.assert_status(StatusCode::FORBIDDEN);
+        append.assert_text("E2E_SENDER_DEVICE_REVOKED").await;
+    }
+
+    #[tokio::test]
+    async fn test_retired_recipient_device_is_not_pending() {
+        let server = TestServer::new().await;
+        let sender_token = server.login_admin_with_device("device-admin").await;
+        let uid = server
+            .create_user(&sender_token, "pending_retired@voce.chat")
+            .await;
+        let recipient_token_1 = server
+            .login_with_device("pending_retired@voce.chat", "device-1")
+            .await;
+        let recipient_token_2 = server
+            .login_with_device("pending_retired@voce.chat", "device-2")
+            .await;
+        put_identity(&server, &recipient_token_1, "device-1").await;
+        put_identity(&server, &recipient_token_2, "device-2").await;
+        let mid = send_pending_dm(
+            &server,
+            &sender_token,
+            "device-admin",
+            uid,
+            "local-pending-retired-recipient",
+        )
+        .await;
+        server
+            .post(format!("/api/user/e2e/pending/{mid}/envelope"))
+            .header("X-API-Key", &sender_token)
+            .body_json(&json!({
+                "recipient_uid": uid,
+                "device_id": "device-1",
+                "envelope": "wrapped-device-1",
+            }))
+            .send()
+            .await
+            .assert_status_is_ok();
+
+        server
+            .delete("/api/user/devices/device-2")
+            .header("X-API-Key", &recipient_token_1)
+            .send()
+            .await
+            .assert_status_is_ok();
+        let pending = server
+            .get(format!("/api/user/e2e/pending/{uid}"))
+            .header("X-API-Key", &sender_token)
+            .send()
+            .await;
+        pending.assert_status_is_ok();
+        assert!(!pending
+            .json()
+            .await
+            .value()
+            .array()
+            .iter()
+            .any(|row| row.object().get("mid").i64() == mid));
+        let retired_at: Option<DateTime> = sqlx::query_scalar(
+            "select retired_at from e2e_identity where uid = ? and device_id = 'device-2'",
+        )
+        .bind(uid)
+        .fetch_one(&server.state().db_pool)
+        .await
+        .unwrap();
+        assert!(retired_at.is_some());
+    }
+
+    #[tokio::test]
     async fn test_pending_migration_enforces_unique_device_envelope() {
         let server = TestServer::new().await;
         let admin_token = server.login_admin().await;
@@ -1258,11 +1541,12 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "insert into e2e_pending_envelope (mid, recipient_uid, device_id, envelope, created_at) values (?, ?, ?, ?, ?)",
+            "insert into e2e_pending_envelope (mid, recipient_uid, device_id, identity_version, envelope, created_at) values (?, ?, ?, ?, ?, ?)",
         )
         .bind(9_000_001_i64)
         .bind(uid1)
         .bind("device-1")
+        .bind(1_i64)
         .bind("first")
         .bind(now)
         .execute(&server.state().db_pool)
@@ -1270,16 +1554,129 @@ mod tests {
         .unwrap();
 
         let duplicate = sqlx::query(
-            "insert into e2e_pending_envelope (mid, recipient_uid, device_id, envelope, created_at) values (?, ?, ?, ?, ?)",
+            "insert into e2e_pending_envelope (mid, recipient_uid, device_id, identity_version, envelope, created_at) values (?, ?, ?, ?, ?, ?)",
         )
         .bind(9_000_001_i64)
         .bind(uid1)
         .bind("device-1")
+        .bind(1_i64)
         .bind("second")
         .bind(now)
         .execute(&server.state().db_pool)
         .await;
         assert!(duplicate.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pending_marker_replays_after_sqlite_projection_failure() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin().await;
+        let uid = server
+            .create_user(&admin_token, "pending_replay@voce.chat")
+            .await;
+        let mid = server
+            .state()
+            .msg_db
+            .messages()
+            .send_to_dm_with_pending_marker(uid, uid, b"opaque")
+            .unwrap();
+        let empty_pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        assert!(crate::e2ee_v2::reconcile_pending_dm_markers(
+            &server.state().msg_db,
+            &empty_pool
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            server
+                .state()
+                .msg_db
+                .messages()
+                .pending_message_markers()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            crate::e2ee_v2::reconcile_pending_dm_markers(
+                &server.state().msg_db,
+                &server.state().db_pool,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let projected: (i64, i64) = sqlx::query_as(
+            "select sender_uid, target_uid from e2e_pending_message where mid = ?",
+        )
+        .bind(mid)
+        .fetch_one(&server.state().db_pool)
+        .await
+        .unwrap();
+        assert_eq!(projected, (uid, uid));
+        assert!(server
+            .state()
+            .msg_db
+            .messages()
+            .pending_message_markers()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pending_marker_rejects_conflicting_mid_metadata() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin().await;
+        let sender_uid = server
+            .create_user(&admin_token, "conflict_sender@voce.chat")
+            .await;
+        let marker_target_uid = server
+            .create_user(&admin_token, "conflict_target@voce.chat")
+            .await;
+        let stored_target_uid = server
+            .create_user(&admin_token, "conflict_other@voce.chat")
+            .await;
+        let mid = server
+            .state()
+            .msg_db
+            .messages()
+            .send_to_dm_with_pending_marker(sender_uid, marker_target_uid, b"opaque")
+            .unwrap();
+        sqlx::query(
+            "insert into e2e_pending_message (mid, sender_uid, target_uid, created_at) values (?, ?, ?, ?)",
+        )
+        .bind(mid)
+        .bind(sender_uid)
+        .bind(stored_target_uid)
+        .bind(DateTime::now())
+        .execute(&server.state().db_pool)
+        .await
+        .unwrap();
+
+        let error = crate::e2ee_v2::reconcile_pending_dm_markers(
+            &server.state().msg_db,
+            &server.state().db_pool,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::e2ee_v2::PendingProjectionError::MetadataConflict
+        ));
+        assert_eq!(
+            server
+                .state()
+                .msg_db
+                .messages()
+                .pending_message_markers()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

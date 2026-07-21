@@ -427,6 +427,7 @@ pub struct GroupChangedMessage {
 pub struct E2eIdentityChangedMessage {
     pub uid: i64,
     pub device_id: String,
+    pub identity_version: i64,
     pub updated_at: DateTime,
 }
 
@@ -438,6 +439,7 @@ pub struct E2ePendingEnvelopeAddedMessage {
     pub mid: i64,
     pub recipient_uid: i64,
     pub device_id: String,
+    pub identity_version: i64,
     /// Opaque wrapped content key for `device_id`.
     pub envelope: String,
 }
@@ -772,7 +774,11 @@ pub fn fetch_history_by_time(
 
 enum InternalSendMessageTarget {
     Group { gid: i64, targets: Vec<i64> },
-    Dm { from_uid: i64, to_uid: i64 },
+    Dm {
+        from_uid: i64,
+        to_uid: i64,
+        pending: bool,
+    },
 }
 
 struct InternalSendMessageResult {
@@ -801,17 +807,25 @@ fn internal_send_message(
                 .map_err(InternalServerError)?;
             (mid, targets)
         }
-        InternalSendMessageTarget::Dm { from_uid, to_uid } => {
+        InternalSendMessageTarget::Dm {
+            from_uid,
+            to_uid,
+            pending,
+        } => {
             // send message to dm
-            let mid = state
-                .msg_db
-                .messages()
-                .send_to_dm(
-                    from_uid,
-                    to_uid,
-                    &serde_json::to_vec(&payload).map_err(InternalServerError)?,
-                )
-                .map_err(InternalServerError)?;
+            let message = serde_json::to_vec(&payload).map_err(InternalServerError)?;
+            let mid = if pending {
+                state
+                    .msg_db
+                    .messages()
+                    .send_to_dm_with_pending_marker(from_uid, to_uid, &message)
+            } else {
+                state
+                    .msg_db
+                    .messages()
+                    .send_to_dm(from_uid, to_uid, &message)
+            }
+            .map_err(InternalServerError)?;
             (mid, vec![from_uid, to_uid])
         }
     };
@@ -1031,6 +1045,7 @@ pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poe
 
     // do send
     let from_uid = payload.from_uid;
+    let mut notification: Option<(Vec<String>, String, String, Value)> = None;
     let result = match payload.target {
         MessageTarget::User(MessageTargetUser { uid }) => {
             // send notify
@@ -1059,14 +1074,12 @@ pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poe
                             "vocechat_to_uid": uid.to_string(),
                         });
 
-                        send_notify(
-                            state.clone(),
+                        notification = Some((
                             notify_tokens,
                             user.name.clone(),
                             notify_message,
                             data,
-                        )
-                        .await;
+                        ));
                     }
                 }
             };
@@ -1080,6 +1093,7 @@ pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poe
                         InternalSendMessageTarget::Dm {
                             from_uid,
                             to_uid: uid,
+                            pending: pending_dm_target.is_some(),
                         },
                         payload,
                     )
@@ -1139,14 +1153,12 @@ pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poe
                         .flatten()
                         .collect::<Vec<_>>();
 
-                    send_notify(
-                        state.clone(),
+                    notification = Some((
                         notify_tokens,
                         group.name.clone(),
                         format!("{}: {}", user.name, notify_message),
                         data,
-                    )
-                    .await;
+                    ));
                 }
             }
 
@@ -1170,9 +1182,20 @@ pub async fn send_message(state: &State, mut payload: ChatMessagePayload) -> poe
     };
 
     if let Some(target_uid) = pending_dm_target {
-        crate::e2ee_v2::insert_pending_dm(&state.db_pool, result.mid, from_uid, target_uid)
+        debug_assert_eq!(
+            target_uid,
+            match result.payload.target {
+                MessageTarget::User(MessageTargetUser { uid }) => uid,
+                MessageTarget::Group(_) => unreachable!(),
+            }
+        );
+        crate::e2ee_v2::reconcile_pending_dm_markers(&state.msg_db, &state.db_pool)
             .await
             .map_err(InternalServerError)?;
+    }
+
+    if let Some((tokens, title, message, data)) = notification {
+        send_notify(state.clone(), tokens, title, message, data).await;
     }
 
     let mid = result.mid;

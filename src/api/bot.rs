@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::HashMap, str::FromStr};
 
 use chrono::Datelike;
 use futures_util::TryFutureExt;
@@ -14,6 +14,7 @@ use poem_openapi::{
     payload::Json,
     OpenApi,
 };
+use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
 use crate::{
@@ -43,6 +44,21 @@ async fn check_api_key(state: &State, uid: i64, key: &str) -> Result<()> {
         })
         .ok_or_else(|| Error::from_status(StatusCode::UNAUTHORIZED))?;
     bot_key.last_used = Some(DateTime::now());
+    Ok(())
+}
+
+fn reject_deferred_bot_protocol(properties: &Option<HashMap<String, Value>>) -> Result<()> {
+    if properties
+        .as_ref()
+        .and_then(|properties| properties.get("protocol"))
+        .and_then(Value::as_str)
+        == Some("dr-pending")
+    {
+        return Err(Error::from_string(
+            "E2E_BOT_DEFERRED_UNAVAILABLE",
+            StatusCode::BAD_REQUEST,
+        ));
+    }
     Ok(())
 }
 
@@ -83,6 +99,9 @@ impl ApiBot {
             .ok_or_else(|| Error::from_status(StatusCode::UNAUTHORIZED))?;
         check_api_key(&state, current_uid, &api_key).await?;
         let properties = parse_properties_from_base64(properties.0);
+        if matches!(&req, SendMessageRequest::E2eV2(_)) {
+            reject_deferred_bot_protocol(&properties)?;
+        }
         let payload = req
             .into_chat_message_payload(&state, current_uid, MessageTarget::user(uid.0), properties)
             .await?;
@@ -347,5 +366,25 @@ impl ApiBot {
             })));
         }
         Ok(Json(None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::reject_deferred_bot_protocol;
+
+    #[test]
+    fn bot_rejects_deferred_dm_protocol_until_managed_bot_support_exists() {
+        let properties = Some(HashMap::from([(
+            "protocol".to_string(),
+            json!("dr-pending"),
+        )]));
+        let error = reject_deferred_bot_protocol(&properties).unwrap_err();
+        assert_eq!(error.status(), poem::http::StatusCode::BAD_REQUEST);
+        assert_eq!(error.to_string(), "E2E_BOT_DEFERRED_UNAVAILABLE");
     }
 }

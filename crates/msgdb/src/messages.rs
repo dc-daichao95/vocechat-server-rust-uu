@@ -6,6 +6,13 @@ pub struct Messages<'a> {
     pub(crate) db: &'a MsgDb,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingMessageMarker {
+    pub mid: i64,
+    pub sender_uid: i64,
+    pub target_uid: i64,
+}
+
 impl<'a> Messages<'a> {
     pub fn get(&self, mid: i64) -> Result<Option<Vec<u8>>> {
         Ok(self.db.db.get(key_msg(mid))?.map(|data| data.to_vec()))
@@ -29,6 +36,25 @@ impl<'a> Messages<'a> {
     }
 
     pub fn send_to_dm(&self, from_uid: i64, to_uid: i64, msg: &[u8]) -> Result<i64> {
+        self.send_to_dm_inner(from_uid, to_uid, msg, false)
+    }
+
+    pub fn send_to_dm_with_pending_marker(
+        &self,
+        from_uid: i64,
+        to_uid: i64,
+        msg: &[u8],
+    ) -> Result<i64> {
+        self.send_to_dm_inner(from_uid, to_uid, msg, true)
+    }
+
+    fn send_to_dm_inner(
+        &self,
+        from_uid: i64,
+        to_uid: i64,
+        msg: &[u8],
+        pending: bool,
+    ) -> Result<i64> {
         let id = self.db.generate_msg_id()?;
         let mut batch = Batch::default();
         batch.insert(&key_msg(id), msg);
@@ -36,8 +62,37 @@ impl<'a> Messages<'a> {
             batch.insert(&key_user_msg(target_uid, id), msg);
         }
         batch.insert(&key_dm_msg(from_uid, to_uid, id), msg);
+        if pending {
+            batch.insert(
+                &key_pending_message_marker(id),
+                &pending_marker_value(from_uid, to_uid),
+            );
+        }
         self.db.db.apply_batch(batch)?;
         Ok(id)
+    }
+
+    pub fn pending_message_markers(&self) -> Result<Vec<PendingMessageMarker>> {
+        let mut markers = Vec::new();
+        for item in self.db.db.scan_prefix(b"PEND/") {
+            let (key, value) = item?;
+            if let (Some(mid), Some((sender_uid, target_uid))) = (
+                decode_key_pending_message_marker(&key),
+                decode_pending_marker_value(&value),
+            ) {
+                markers.push(PendingMessageMarker {
+                    mid,
+                    sender_uid,
+                    target_uid,
+                });
+            }
+        }
+        Ok(markers)
+    }
+
+    pub fn remove_pending_message_marker(&self, mid: i64) -> Result<()> {
+        self.db.db.remove(key_pending_message_marker(mid))?;
+        Ok(())
     }
 
     pub fn fetch_user_messages_after(
@@ -213,6 +268,38 @@ fn key_merged_msg(msg_id: i64) -> [u8; 13] {
     data
 }
 
+fn key_pending_message_marker(msg_id: i64) -> [u8; 13] {
+    let mut data = [0; 13];
+    data[0..5].copy_from_slice(b"PEND/");
+    data[5..13].copy_from_slice(&msg_id.to_be_bytes());
+    data
+}
+
+fn decode_key_pending_message_marker(data: &[u8]) -> Option<i64> {
+    let data = data.strip_prefix(b"PEND/")?;
+    if data.len() != 8 {
+        return None;
+    }
+    Some(i64::from_be_bytes(data.try_into().ok()?))
+}
+
+fn pending_marker_value(sender_uid: i64, target_uid: i64) -> [u8; 16] {
+    let mut data = [0; 16];
+    data[0..8].copy_from_slice(&sender_uid.to_be_bytes());
+    data[8..16].copy_from_slice(&target_uid.to_be_bytes());
+    data
+}
+
+fn decode_pending_marker_value(data: &[u8]) -> Option<(i64, i64)> {
+    if data.len() != 16 {
+        return None;
+    }
+    Some((
+        i64::from_be_bytes(data[0..8].try_into().ok()?),
+        i64::from_be_bytes(data[8..16].try_into().ok()?),
+    ))
+}
+
 fn key_user_msg(uid: i64, msg_id: i64) -> [u8; 21] {
     let mut data = [0; 21];
     data[0..5].copy_from_slice(b"UMSG/");
@@ -269,4 +356,38 @@ fn decode_key_dm_msg(data: &[u8]) -> Option<(i64, i64, i64)> {
     let to_uid = i64::from_be_bytes(data[8..16].try_into().unwrap());
     let msg_id = i64::from_be_bytes(data[16..24].try_into().unwrap());
     Some((from_uid, to_uid, msg_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{MsgDb, PendingMessageMarker};
+
+    #[test]
+    fn pending_marker_is_written_with_canonical_dm_and_can_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MsgDb::open(dir.path()).unwrap();
+
+        let mid = db
+            .messages()
+            .send_to_dm_with_pending_marker(7, 9, b"opaque")
+            .unwrap();
+
+        assert_eq!(db.messages().get(mid).unwrap(), Some(b"opaque".to_vec()));
+        assert_eq!(
+            db.messages().pending_message_markers().unwrap(),
+            vec![PendingMessageMarker {
+                mid,
+                sender_uid: 7,
+                target_uid: 9,
+            }]
+        );
+
+        db.messages().remove_pending_message_marker(mid).unwrap();
+        assert!(db
+            .messages()
+            .pending_message_markers()
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.messages().get(mid).unwrap(), Some(b"opaque".to_vec()));
+    }
 }

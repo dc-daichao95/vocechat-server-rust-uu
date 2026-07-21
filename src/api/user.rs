@@ -1162,16 +1162,27 @@ impl ApiUser {
     ) -> Result<()> {
         let mut cache = state.cache.write().await;
 
+        let mut tx = state.db_pool.begin().await.map_err(InternalServerError)?;
         let rows_affected = sqlx::query("delete from device where uid = ? and device = ?")
             .bind(token.uid)
             .bind(&device.0)
-            .execute(&state.db_pool)
+            .execute(&mut tx)
             .await
             .map_err(InternalServerError)?
             .rows_affected();
         if rows_affected == 0 {
             return Err(Error::from_status(StatusCode::UNAUTHORIZED));
         }
+        sqlx::query(
+            "update e2e_identity set retired_at = ? where uid = ? and device_id = ? and retired_at is null",
+        )
+        .bind(DateTime::now())
+        .bind(token.uid)
+        .bind(&device.0)
+        .execute(&mut tx)
+        .await
+        .map_err(InternalServerError)?;
+        tx.commit().await.map_err(InternalServerError)?;
 
         let user = cache
             .users
@@ -1998,13 +2009,20 @@ async fn events_loop(
                                     }
                                 }
                             }
-                            BroadcastEvent::E2eIdentityChanged { targets, uid, device_id, updated_at } => {
+                            BroadcastEvent::E2eIdentityChanged {
+                                targets,
+                                uid,
+                                device_id,
+                                identity_version,
+                                updated_at,
+                            } => {
                                 if !targets.contains(&current_uid) {
                                     continue;
                                 }
                                 let msg = Message::E2eIdentityChanged(E2eIdentityChangedMessage {
                                     uid: *uid,
                                     device_id: device_id.clone(),
+                                    identity_version: *identity_version,
                                     updated_at: *updated_at,
                                 });
                                 if tx_msg.send(msg).is_err() {
@@ -2016,6 +2034,7 @@ async fn events_loop(
                                 mid,
                                 recipient_uid,
                                 device_id,
+                                identity_version,
                                 envelope,
                             } => {
                                 if !targets.contains(&current_uid) {
@@ -2026,6 +2045,7 @@ async fn events_loop(
                                         mid: *mid,
                                         recipient_uid: *recipient_uid,
                                         device_id: device_id.clone(),
+                                        identity_version: *identity_version,
                                         envelope: envelope.clone(),
                                     },
                                 );

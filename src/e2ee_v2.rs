@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fmt};
 
+use rc_msgdb::{MsgDb, PendingMessageMarker};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
@@ -213,14 +214,32 @@ pub async fn reserve_mls_sequence(
     tx.commit().await.map_err(MlsSequenceError::Database)
 }
 
-/// Record deferred-DM pending metadata for a canonical message that was just
-/// persisted (send_to_dm). Idempotent on `mid` so retried sends do not error.
-pub async fn insert_pending_dm(
+#[derive(Debug)]
+pub enum PendingProjectionError {
+    MetadataConflict,
+    Sqlite(sqlx::Error),
+    Marker(rc_msgdb::Error),
+}
+
+impl fmt::Display for PendingProjectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MetadataConflict => formatter.write_str("E2E_PENDING_METADATA_CONFLICT"),
+            Self::Sqlite(error) => write!(formatter, "pending metadata SQLite error: {error}"),
+            Self::Marker(error) => write!(formatter, "pending marker storage error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PendingProjectionError {}
+
+/// Idempotently project one durable Sled pending marker into SQLite. An
+/// existing mid must describe the same sender and target.
+pub async fn project_pending_dm_marker(
     pool: &SqlitePool,
-    mid: i64,
-    sender_uid: i64,
-    target_uid: i64,
-) -> Result<(), sqlx::Error> {
+    marker: PendingMessageMarker,
+) -> Result<(), PendingProjectionError> {
+    let mut tx = pool.begin().await.map_err(PendingProjectionError::Sqlite)?;
     sqlx::query(
         r#"
         insert into e2e_pending_message (mid, sender_uid, target_uid, created_at)
@@ -228,13 +247,51 @@ pub async fn insert_pending_dm(
         on conflict(mid) do nothing
         "#,
     )
-    .bind(mid)
-    .bind(sender_uid)
-    .bind(target_uid)
+    .bind(marker.mid)
+    .bind(marker.sender_uid)
+    .bind(marker.target_uid)
     .bind(DateTime::now())
-    .execute(pool)
-    .await?;
+    .execute(&mut tx)
+    .await
+    .map_err(PendingProjectionError::Sqlite)?;
+
+    let stored = sqlx::query_as::<_, (i64, i64)>(
+        "select sender_uid, target_uid from e2e_pending_message where mid = ?",
+    )
+    .bind(marker.mid)
+    .fetch_one(&mut tx)
+    .await
+    .map_err(PendingProjectionError::Sqlite)?;
+    if stored != (marker.sender_uid, marker.target_uid) {
+        return Err(PendingProjectionError::MetadataConflict);
+    }
+
+    tx.commit()
+        .await
+        .map_err(PendingProjectionError::Sqlite)?;
     Ok(())
+}
+
+/// Replay every durable marker and remove it only after the SQLite projection
+/// commits. A failed projection leaves the marker available for a later retry.
+pub async fn reconcile_pending_dm_markers(
+    msg_db: &MsgDb,
+    pool: &SqlitePool,
+) -> Result<usize, PendingProjectionError> {
+    let markers = msg_db
+        .messages()
+        .pending_message_markers()
+        .map_err(PendingProjectionError::Marker)?;
+    let mut reconciled = 0;
+    for marker in markers {
+        project_pending_dm_marker(pool, marker).await?;
+        msg_db
+            .messages()
+            .remove_pending_message_marker(marker.mid)
+            .map_err(PendingProjectionError::Marker)?;
+        reconciled += 1;
+    }
+    Ok(reconciled)
 }
 
 pub fn validate_properties(
