@@ -37,14 +37,14 @@ pub use e2e::redact_e2e_chat_message_json;
 pub use group::{Group, PinnedMessage};
 pub use langid::LangId;
 pub use message::{
-    get_merged_message, BurnAfterReadingGroup, BurnAfterReadingUser, ChatMessage,
-    ChatMessagePayload, E2eIdentityChangedMessage, E2ePendingEnvelopeAddedMessage,
-    GroupChangedMessage, HeartbeatMessage, JoinedGroupMessage, KickFromGroupMessage,
-    KickFromGroupReason, KickMessage, KickReason, Message, MessageDetail, MessageTarget,
-    MessageTargetGroup, MessageTargetUser, MuteGroup, MuteUser, ReadIndexGroup, ReadIndexUser,
-    RelatedGroupsMessage, UserJoinedGroupMessage, UserLeavedGroupMessage,
-    UserSettingsChangedMessage, UserSettingsMessage, UserState, UserStateChangedMessage,
-    UserUpdateLog, UsersStateMessage, UsersUpdateLogMessage,
+    get_merged_message, send_message, BurnAfterReadingGroup, BurnAfterReadingUser, ChatMessage,
+    ChatMessageContent, ChatMessagePayload, E2eIdentityChangedMessage,
+    E2ePendingEnvelopeAddedMessage, GroupChangedMessage, HeartbeatMessage, JoinedGroupMessage,
+    KickFromGroupMessage, KickFromGroupReason, KickMessage, KickReason, Message, MessageDetail,
+    MessageNormal, MessageTarget, MessageTargetGroup, MessageTargetUser, MuteGroup, MuteUser,
+    ReadIndexGroup, ReadIndexUser, RelatedGroupsMessage, UserJoinedGroupMessage,
+    UserLeavedGroupMessage, UserSettingsChangedMessage, UserSettingsMessage, UserState,
+    UserStateChangedMessage, UserUpdateLog, UsersStateMessage, UsersUpdateLogMessage,
 };
 pub use resource::FileMeta;
 pub use token::{CurrentUser, Token};

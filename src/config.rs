@@ -11,6 +11,23 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::api::LangId;
 
+/// Docker-secret-style env var: path to a file containing the base64
+/// encoded 32-byte AES-256-GCM master key used to encrypt Bot E2EE
+/// private key material at rest (see `src/bot_e2ee.rs`). Read on demand
+/// (never cached in-process) so operators can rotate the underlying file
+/// without a restart; the raw/decoded value is never logged.
+pub const BOT_E2EE_MASTER_KEY_FILE_ENV: &str = "VOCECHAT_BOT_E2EE_MASTER_KEY_FILE";
+
+/// Read an env var that names a file path, then read+trim that file's
+/// contents. Returns `None` if the env var is unset or the file cannot be
+/// read; never logs the file contents.
+pub fn read_env_file_secret(env_var: &str) -> Option<String> {
+    let path = std::env::var(env_var).ok()?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KeyConfig {
     pub server_id: String,

@@ -1442,6 +1442,64 @@ pub(crate) async fn forward_chat_messages_to_webhook(state: State) {
     }
 }
 
+/// Deliver Bot-decrypted plaintext to exactly one Bot's own webhook. This
+/// is intentionally separate from [`forward_chat_messages_to_webhook`],
+/// which always redacts E2E content to `e2e_opaque` for every webhook
+/// (including this same Bot's). Only code paths inside the Bot E2EE
+/// "Bot context" (`src/bot_e2ee.rs`, after successfully decrypting a
+/// message addressed to that specific Bot) may call this. Best-effort:
+/// silently returns if the Bot has no webhook configured.
+pub(crate) async fn deliver_bot_webhook_plaintext(
+    state: &State,
+    bot_uid: i64,
+    mid: i64,
+    from_uid: i64,
+    content_type: &str,
+    plaintext: &str,
+) {
+    let webhook_url = {
+        let cache = state.cache.read().await;
+        cache
+            .users
+            .get(&bot_uid)
+            .and_then(|user| user.webhook_url.clone())
+    };
+    let Some(webhook_url) = webhook_url else {
+        return;
+    };
+    let body = serde_json::json!({
+        "mid": mid,
+        "from_uid": from_uid,
+        "to_uid": bot_uid,
+        "e2e": true,
+        "e2e_bot_decrypted": true,
+        "detail": {
+            "type": "normal",
+            "content_type": content_type,
+            "content": plaintext,
+        }
+    })
+    .to_string();
+
+    let client = Client::new();
+    tokio::spawn(async move {
+        for _ in 0..3 {
+            if client
+                .post(&webhook_url)
+                .header("content-type", "application/json")
+                .body(body.clone())
+                .send()
+                .await
+                .and_then(|resp| resp.error_for_status())
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::Path, time::Duration};

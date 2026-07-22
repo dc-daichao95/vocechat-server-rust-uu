@@ -302,6 +302,54 @@ pub async fn reconcile_pending_dm_markers(
     Ok(reconciled)
 }
 
+/// Idempotently append one recipient-device envelope to a deferred DM and
+/// mark the pending message completed, without any HTTP-caller
+/// authentication (the sender identity has already been established by
+/// the internal caller -- e.g. the Bot crypto engine appending an
+/// envelope on a Bot's own behalf). Mirrors the insert performed by the
+/// authenticated `POST /user/e2e/pending/:mid/envelope` handler. Returns
+/// `true` if a new row was inserted (an existing row for the same
+/// (mid, recipient_uid, device_id, identity_version) is left untouched).
+pub async fn append_pending_envelope_internal(
+    pool: &SqlitePool,
+    mid: i64,
+    recipient_uid: i64,
+    device_id: &str,
+    identity_version: i64,
+    envelope: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let now = crate::api::DateTime::now();
+    let insert_result = sqlx::query(
+        r#"
+        insert into e2e_pending_envelope
+          (mid, recipient_uid, device_id, identity_version, envelope, created_at)
+        values (?, ?, ?, ?, ?, ?)
+        on conflict(mid, recipient_uid, device_id, identity_version) do nothing
+        "#,
+    )
+    .bind(mid)
+    .bind(recipient_uid)
+    .bind(device_id)
+    .bind(identity_version)
+    .bind(envelope)
+    .bind(now)
+    .execute(&mut tx)
+    .await?;
+    let added = insert_result.rows_affected() != 0;
+    if added {
+        sqlx::query(
+            "update e2e_pending_message set completed_at = ? where mid = ? and completed_at is null",
+        )
+        .bind(now)
+        .bind(mid)
+        .execute(&mut tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(added)
+}
+
 pub fn validate_properties(
     properties: &HashMap<String, Value>,
 ) -> Result<RoutingProperties, E2eV2Error> {

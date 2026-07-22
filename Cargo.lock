@@ -5661,6 +5661,7 @@ dependencies = [
 name = "vocechat-server"
 version = "0.3.6"
 dependencies = [
+ "aes-gcm",
  "agora-token",
  "anyhow",
  "async-stream",
@@ -5689,6 +5690,7 @@ dependencies = [
  "parking_lot 0.11.2",
  "poem",
  "poem-openapi",
+ "rand 0.8.5",
  "rc-fcm",
  "rc-magic-link",
  "rc-msgdb",
@@ -5713,8 +5715,10 @@ dependencies = [
  "url 1.7.2",
  "uuid 0.8.2",
  "vc-license",
+ "voce-e2ee-core",
  "walkdir",
  "web3",
+ "zeroize",
  "zip",
 ]
 

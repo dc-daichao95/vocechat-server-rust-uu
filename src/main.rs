@@ -3,6 +3,7 @@
 
 mod api;
 mod api_key;
+mod bot_e2ee;
 mod config;
 mod create_user;
 mod e2ee_v2;
