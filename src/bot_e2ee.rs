@@ -74,6 +74,15 @@
 //! Generic (non-Bot) webhook forwarding keeps redacting E2E content to
 //! `e2e_opaque` (`redact_e2e_chat_message_json`, unchanged).
 //!
+//! Note on metadata verification: in this wire shape the AAD commitment
+//! (`sha256`) is derived locally from the received `metadata` and is never
+//! transmitted, so the mandatory `deferred_verify_metadata` call on the
+//! inbound path is a tautology (contract compliance, per Task 3), not an
+//! independent defense. The actual tamper-evidence is the AES-256-GCM tag
+//! inside `deferred_decrypt`, which uses that same `sha256` as AAD -- any
+//! tampering with metadata or ciphertext fails the tag with no plaintext
+//! fallback. See the inline comment in `handle_inbound_bot_envelope`.
+//!
 //! ## MLS admission (channels)
 //!
 //! Enabling a channel for a Bot ([`set_channel_enabled`]) publishes a
@@ -1006,13 +1015,56 @@ pub async fn set_channel_enabled(
 // Crypto engine: outbound Bot DM (deferred encrypt + per-device wrap)
 // ---------------------------------------------------------------------
 
-/// A device of `target_uid` that currently has a usable (deferred-crypto
-/// capable) published bundle -- see the module docs' wire contract for
-/// what "usable" means.
-async fn fetch_target_devices_with_bundle(
+/// One usable (deferred-crypto capable) device of a user: its id, current
+/// identity `key_version`, and validated public identity + signed prekey.
+///
+/// The one-time prekey is intentionally NOT read/consumed here -- it is
+/// peeked and then atomically claimed only *after* a successful wrap (see
+/// [`wrap_content_key_for_device`]), so a wrap failure never shrinks the
+/// target's OTP pool and two concurrent sends can never share one OTP.
+#[derive(Clone)]
+struct UsableDevice {
+    uid: i64,
+    device_id: String,
+    key_version: i64,
+    identity: IdentityPublic,
+    signed_prekey: SignedPreKeyPublic,
+}
+
+fn to_usable_device(
+    uid: i64,
+    device_id: String,
+    key_version: i64,
+    identity_key_pub: String,
+    signed_prekey_pub: Option<String>,
+    signed_prekey_sig: Option<String>,
+) -> Option<UsableDevice> {
+    let signed_prekey_pub = signed_prekey_pub.filter(|v| !v.trim().is_empty())?;
+    let signed_prekey_sig = signed_prekey_sig.filter(|v| !v.trim().is_empty())?;
+    let identity = serde_json::from_str::<IdentityPublic>(&identity_key_pub).ok()?;
+    let signed_prekey = SignedPreKeyPublic {
+        key_id: BOT_KEY_ID,
+        dh_pub_b64: signed_prekey_pub,
+        signature_b64: signed_prekey_sig,
+    };
+    if verify_signed_prekey(&identity, &signed_prekey).is_err() {
+        return None;
+    }
+    Some(UsableDevice {
+        uid,
+        device_id,
+        key_version,
+        identity,
+        signed_prekey,
+    })
+}
+
+/// Every currently usable (non-retired, deferred-crypto capable) device of
+/// `target_uid`.
+async fn fetch_target_devices(
     state: &State,
     target_uid: i64,
-) -> Result<Vec<(String, i64, PreKeyBundle)>, BotE2eeError> {
+) -> Result<Vec<UsableDevice>, BotE2eeError> {
     let rows = sqlx::query_as::<_, (String, i64, String, Option<String>, Option<String>)>(
         "select device_id, key_version, identity_key_pub, signed_prekey_pub, signed_prekey_sig \
          from e2e_identity where uid = ? and retired_at is null",
@@ -1021,87 +1073,47 @@ async fn fetch_target_devices_with_bundle(
     .fetch_all(&state.db_pool)
     .await?;
 
-    let mut out = Vec::new();
-    for (device_id, key_version, identity_key_pub, signed_prekey_pub, signed_prekey_sig) in rows {
-        let Some(signed_prekey_pub) = signed_prekey_pub.filter(|v| !v.trim().is_empty()) else {
-            continue;
-        };
-        let Some(signed_prekey_sig) = signed_prekey_sig.filter(|v| !v.trim().is_empty()) else {
-            continue;
-        };
-        let Ok(identity) = serde_json::from_str::<IdentityPublic>(&identity_key_pub) else {
-            continue;
-        };
-        let signed_prekey = SignedPreKeyPublic {
-            key_id: BOT_KEY_ID,
-            dh_pub_b64: signed_prekey_pub,
-            signature_b64: signed_prekey_sig,
-        };
-        if verify_signed_prekey(&identity, &signed_prekey).is_err() {
-            continue;
-        }
-        let otp = consume_one_time_prekey(&state.db_pool, target_uid, &device_id).await?;
-        out.push((
-            device_id,
-            key_version,
-            PreKeyBundle {
-                identity,
-                signed_prekey,
-                one_time_prekey_b64: otp.as_ref().map(|(_, pk)| pk.clone()),
-                one_time_prekey_id: otp.as_ref().map(|(id, _)| *id),
-            },
-        ));
-    }
-    Ok(out)
+    Ok(rows
+        .into_iter()
+        .filter_map(|(device_id, key_version, identity_key_pub, spk_pub, spk_sig)| {
+            to_usable_device(target_uid, device_id, key_version, identity_key_pub, spk_pub, spk_sig)
+        })
+        .collect())
 }
 
-async fn fetch_one_device_bundle(
+async fn fetch_one_device(
     pool: &SqlitePool,
     uid: i64,
     device_id: &str,
-) -> Result<Option<PreKeyBundle>, BotE2eeError> {
-    let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-        "select identity_key_pub, signed_prekey_pub, signed_prekey_sig \
+) -> Result<Option<UsableDevice>, BotE2eeError> {
+    let row = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>)>(
+        "select key_version, identity_key_pub, signed_prekey_pub, signed_prekey_sig \
          from e2e_identity where uid = ? and device_id = ? and retired_at is null",
     )
     .bind(uid)
     .bind(device_id)
     .fetch_optional(pool)
     .await?;
-    let Some((identity_key_pub, signed_prekey_pub, signed_prekey_sig)) = row else {
+    let Some((key_version, identity_key_pub, spk_pub, spk_sig)) = row else {
         return Ok(None);
     };
-    let Some(signed_prekey_pub) = signed_prekey_pub.filter(|v| !v.trim().is_empty()) else {
-        return Ok(None);
-    };
-    let Some(signed_prekey_sig) = signed_prekey_sig.filter(|v| !v.trim().is_empty()) else {
-        return Ok(None);
-    };
-    let Ok(identity) = serde_json::from_str::<IdentityPublic>(&identity_key_pub) else {
-        return Ok(None);
-    };
-    let signed_prekey = SignedPreKeyPublic {
-        key_id: BOT_KEY_ID,
-        dh_pub_b64: signed_prekey_pub,
-        signature_b64: signed_prekey_sig,
-    };
-    if verify_signed_prekey(&identity, &signed_prekey).is_err() {
-        return Ok(None);
-    }
-    let otp = consume_one_time_prekey(pool, uid, device_id).await?;
-    Ok(Some(PreKeyBundle {
-        identity,
-        signed_prekey,
-        one_time_prekey_b64: otp.as_ref().map(|(_, pk)| pk.clone()),
-        one_time_prekey_id: otp.as_ref().map(|(id, _)| *id),
-    }))
+    Ok(to_usable_device(
+        uid,
+        device_id.to_string(),
+        key_version,
+        identity_key_pub,
+        spk_pub,
+        spk_sig,
+    ))
 }
 
-async fn consume_one_time_prekey(
+/// Peek (without consuming) the next unconsumed one-time prekey for a
+/// device. Returns `(id, key_id, public_key)`.
+async fn peek_one_time_prekey(
     pool: &SqlitePool,
     uid: i64,
     device_id: &str,
-) -> Result<Option<(u32, String)>, BotE2eeError> {
+) -> Result<Option<(i64, u32, String)>, BotE2eeError> {
     let row = sqlx::query_as::<_, (i64, i32, String)>(
         "select id, key_id, public_key from e2e_prekey \
          where uid = ? and device_id = ? and consumed = false order by id asc limit 1",
@@ -1110,15 +1122,80 @@ async fn consume_one_time_prekey(
     .bind(device_id)
     .fetch_optional(pool)
     .await?;
-    if let Some((id, key_id, public_key)) = row {
-        sqlx::query("update e2e_prekey set consumed = true where id = ?")
-            .bind(id)
-            .execute(pool)
-            .await?;
-        Ok(Some((key_id as u32, public_key)))
-    } else {
-        Ok(None)
+    Ok(row.map(|(id, key_id, public_key)| (id, key_id as u32, public_key)))
+}
+
+/// Atomically claim a specific one-time prekey by id. Returns `true` only
+/// if *this* call flipped it from unconsumed to consumed -- the
+/// `and consumed = false` guard means a concurrent claimer of the same row
+/// gets `false` (0 rows affected), so two sends can never share one OTP.
+async fn try_consume_one_time_prekey(pool: &SqlitePool, id: i64) -> Result<bool, BotE2eeError> {
+    let result = sqlx::query("update e2e_prekey set consumed = true where id = ? and consumed = false")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Wrap `content_key` for one device, consuming exactly one of the
+/// device's one-time prekeys **only after** the wrap succeeds.
+///
+/// This resolves two forward-secrecy hazards:
+/// - Wrap-then-consume ordering (never consume-then-wrap): a failed
+///   `deferred_wrap_key` returns `Ok(None)` and leaves the OTP pool
+///   untouched, so a bad/corrupt OTP or transient wrap error never burns a
+///   prekey (fix for review item 3).
+/// - Atomic claim with retry: the OTP is peeked, wrapped, then claimed via
+///   [`try_consume_one_time_prekey`]'s `and consumed = false` guard. If a
+///   concurrent send claimed the peeked OTP first, we discard that wrap and
+///   retry with a fresh peek, so two sends can never reuse one OTP id (fix
+///   for review item 2).
+///
+/// One-time prekeys are optional in X3DH; if none remain (or a bounded
+/// number of claim races are lost), we fall back to an OTP-less wrap, which
+/// is still a valid X3DH agreement over the signed prekey.
+async fn wrap_content_key_for_device(
+    pool: &SqlitePool,
+    content_key: &[u8; 32],
+    device: &UsableDevice,
+) -> Result<Option<DeferredEnvelope>, BotE2eeError> {
+    const MAX_CLAIM_RETRIES: usize = 8;
+
+    for _ in 0..MAX_CLAIM_RETRIES {
+        let otp = peek_one_time_prekey(pool, device.uid, &device.device_id).await?;
+        let bundle = PreKeyBundle {
+            identity: device.identity.clone(),
+            signed_prekey: device.signed_prekey.clone(),
+            one_time_prekey_b64: otp.as_ref().map(|(_, _, pk)| pk.clone()),
+            one_time_prekey_id: otp.as_ref().map(|(_, key_id, _)| *key_id),
+        };
+        // Wrap BEFORE consuming: a failure here must not burn the OTP.
+        let envelope = match deferred_wrap_key(content_key, &bundle) {
+            Ok(envelope) => envelope,
+            Err(_) => return Ok(None),
+        };
+        match otp {
+            // No OTP was used -> nothing to claim.
+            None => return Ok(Some(envelope)),
+            Some((id, _, _)) => {
+                if try_consume_one_time_prekey(pool, id).await? {
+                    return Ok(Some(envelope));
+                }
+                // Lost the claim race for this OTP; discard this envelope
+                // and retry with a freshly-peeked prekey.
+            }
+        }
     }
+
+    // Contention fallback: wrap without a one-time prekey (still forward-
+    // secret via the signed prekey).
+    let bundle = PreKeyBundle {
+        identity: device.identity.clone(),
+        signed_prekey: device.signed_prekey.clone(),
+        one_time_prekey_b64: None,
+        one_time_prekey_id: None,
+    };
+    Ok(deferred_wrap_key(content_key, &bundle).ok())
 }
 
 /// Encrypt+send one plaintext DM on behalf of a Bot. Called from
@@ -1182,17 +1259,19 @@ pub async fn send_bot_dm(
         .await
         .map_err(|e| BotE2eeError::Internal(e.to_string()))?;
 
-    let devices = fetch_target_devices_with_bundle(state, target_uid).await?;
+    let devices = fetch_target_devices(state, target_uid).await?;
     let mut appended_any = false;
-    for (device_id, identity_version, bundle) in devices {
-        if let Ok(envelope) = deferred_wrap_key(&encrypted.content_key, &bundle) {
+    for device in devices {
+        if let Some(envelope) =
+            wrap_content_key_for_device(&state.db_pool, &encrypted.content_key, &device).await?
+        {
             let envelope_b64 = base64::encode(serde_json::to_vec(&envelope).unwrap_or_default());
             if crate::e2ee_v2::append_pending_envelope_internal(
                 &state.db_pool,
                 mid,
                 target_uid,
-                &device_id,
-                identity_version,
+                &device.device_id,
+                device.key_version,
                 &envelope_b64,
             )
             .await?
@@ -1264,7 +1343,7 @@ pub async fn catch_up_pending_sends(
     }
 
     let master_key = load_master_key()?;
-    let Some(bundle) = fetch_one_device_bundle(&state.db_pool, target_uid, device_id).await? else {
+    let Some(device) = fetch_one_device(&state.db_pool, target_uid, device_id).await? else {
         return Err(BotE2eeError::NoUsableRecipientDevice);
     };
 
@@ -1288,7 +1367,13 @@ pub async fn catch_up_pending_sends(
             }
         };
         content_key_vec.zeroize();
-        let envelope = deferred_wrap_key(&content_key, &bundle)?;
+        // Wrap-then-consume (see `wrap_content_key_for_device`): a wrap
+        // failure here skips the message without burning an OTP.
+        let Some(envelope) =
+            wrap_content_key_for_device(&state.db_pool, &content_key, &device).await?
+        else {
+            continue;
+        };
         let envelope_b64 = base64::encode(serde_json::to_vec(&envelope).unwrap_or_default());
         if crate::e2ee_v2::append_pending_envelope_internal(
             &state.db_pool,
@@ -1394,6 +1479,23 @@ pub async fn handle_inbound_bot_envelope(
     };
     let content_key = deferred_unwrap_key(&envelope, &local_identity)?;
 
+    // Metadata handling for the server-managed Bot wire shape.
+    //
+    // In this wire format the AAD commitment (`sha256`) is derived locally
+    // from the `metadata` we just parsed and is never transmitted (see the
+    // module docs' "Wire contract"). So `deferred_verify_metadata` below,
+    // which compares `commitment(metadata)` against a `sha256` that *is*
+    // `commitment(metadata)`, is a tautology -- it cannot fail and is NOT
+    // an independent tamper-evidence layer.
+    //
+    // The real tamper-evidence is the AEAD tag inside `deferred_decrypt`:
+    // `sha256` is used as the AES-256-GCM AAD, so any mutation of the
+    // relayed `metadata` (which changes the derived `sha256`) or of the
+    // ciphertext makes the tag check fail with no plaintext fallback. The
+    // `deferred_verify_metadata` call is kept purely as explicit Task 3
+    // contract compliance ("recipients MUST verify the commitment"); it is
+    // deliberately not relied upon for security. Do not treat its success
+    // as proof of anything -- the AEAD open is the gate.
     let sha256 = deferred_metadata_commitment(&wire.metadata)?;
     if !deferred_verify_metadata(&wire.metadata, &sha256)? {
         return Err(BotE2eeError::MetadataMismatch);
@@ -2118,5 +2220,310 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BotE2eeError::MissingMasterKey));
+    }
+
+    // -- review-fix helpers ----------------------------------------------
+
+    async fn create_bot_api_key(server: &TestServer, admin_token: &str, bot_uid: i64) -> String {
+        let resp = server
+            .post(format!("/api/admin/user/bot-api-key/{bot_uid}"))
+            .header("X-API-Key", admin_token)
+            .body_json(&json!({ "name": "primary" }))
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        resp.json().await.value().string().to_string()
+    }
+
+    /// Publish a real deferred-crypto-capable identity (JSON `IdentityPublic`
+    /// in `identity_key_pub`, per the wire contract) for `token`'s device.
+    async fn publish_deferred_identity(server: &TestServer, token: &str, device_id: &str) {
+        let (secret, public) = IdentitySecret::generate();
+        let (_spk_secret, spk_public) = secret.generate_signed_prekey(1).unwrap();
+        server
+            .put("/api/user/e2e/identity")
+            .header("X-API-Key", token)
+            .body_json(&json!({
+                "device_id": device_id,
+                "identity_key_pub": serde_json::to_string(&public).unwrap(),
+                "signed_prekey_pub": spk_public.dh_pub_b64,
+                "signed_prekey_sig": spk_public.signature_b64,
+            }))
+            .send()
+            .await
+            .assert_status_is_ok();
+    }
+
+    /// Insert one one-time prekey row for a device with a real
+    /// (X3DH-decodable) X25519 public key, so `deferred_wrap_key` succeeds.
+    async fn insert_valid_otp(pool: &SqlitePool, uid: i64, device_id: &str, key_id: i32) {
+        let (_sec, _pub) = IdentitySecret::generate();
+        let (_spk_sec, spk_pub) = _sec.generate_signed_prekey(key_id as u32).unwrap();
+        sqlx::query(
+            "insert into e2e_prekey (uid, device_id, key_id, public_key, consumed) values (?, ?, ?, ?, false)",
+        )
+        .bind(uid)
+        .bind(device_id)
+        .bind(key_id)
+        .bind(spk_pub.dh_pub_b64)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // -- IMPORTANT 1: HTTP transparent-encryption path -------------------
+
+    #[tokio::test]
+    async fn http_bot_send_transparently_encrypts_plaintext_for_human_with_devices() {
+        let key = test_master_key();
+        let _guard = set_master_key_env(&key);
+        let server = TestServer::new().await;
+        let admin = server.login_admin().await;
+        let bot_uid = create_bot(&server, &admin, "http-enc-bot@voce.chat").await;
+        initialize(server.state(), 1, bot_uid).await.unwrap();
+        let bot_key = create_bot_api_key(&server, &admin, bot_uid).await;
+
+        let target_uid = server.create_user(&admin, "http-enc-target@voce.chat").await;
+        let token = server
+            .login_with_device("http-enc-target@voce.chat", "phone-1")
+            .await;
+        publish_deferred_identity(&server, &token, "phone-1").await;
+
+        // Plain Text POST to the real Bot send API -> must be intercepted by
+        // maybe_send_as_managed_bot and stored as an E2EE v2 envelope, not
+        // plaintext.
+        let resp = server
+            .post(format!("/api/bot/send_to_user/{target_uid}"))
+            .header("x-api-key", &bot_key)
+            .content_type("text/plain")
+            .body("hello from bot over http")
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let mid = resp.json().await.value().i64();
+
+        let merged = get_merged_message(&server.state().msg_db, mid).unwrap().unwrap();
+        assert_eq!(
+            merged.content.content_type,
+            crate::e2ee_v2::CONTENT_TYPE,
+            "plain Bot send must be transparently encrypted, not stored as plaintext"
+        );
+        assert!(
+            !merged.content.content.contains("hello from bot over http"),
+            "stored content must not contain the plaintext body"
+        );
+        // An envelope was wrapped immediately for the human's usable device.
+        let envelope_count: i64 = sqlx::query_scalar(
+            "select count(*) from e2e_pending_envelope where mid = ? and recipient_uid = ?",
+        )
+        .bind(mid)
+        .bind(target_uid)
+        .fetch_one(&server.state().db_pool)
+        .await
+        .unwrap();
+        assert_eq!(envelope_count, 1);
+    }
+
+    #[tokio::test]
+    async fn http_bot_send_not_intercepted_when_uninitialized_or_bot_to_bot() {
+        use poem::http::StatusCode;
+
+        let key = test_master_key();
+        let _guard = set_master_key_env(&key);
+        let server = TestServer::new().await;
+        let admin = server.login_admin().await;
+
+        // (a) Uninitialized Bot -> human: NOT intercepted, so it falls
+        // through to the normal send path, which (gen-2) rejects plaintext
+        // with E2E_REQUIRED. A 200 here would mean it was wrongly
+        // intercepted+encrypted.
+        let uninit_bot = create_bot(&server, &admin, "http-uninit-bot@voce.chat").await;
+        let uninit_key = create_bot_api_key(&server, &admin, uninit_bot).await;
+        let human_uid = server.create_user(&admin, "http-uninit-human@voce.chat").await;
+        let human_token = server
+            .login_with_device("http-uninit-human@voce.chat", "phone-1")
+            .await;
+        publish_deferred_identity(&server, &human_token, "phone-1").await;
+
+        let resp = server
+            .post(format!("/api/bot/send_to_user/{human_uid}"))
+            .header("x-api-key", &uninit_key)
+            .content_type("text/plain")
+            .body("should not be intercepted")
+            .send()
+            .await;
+        resp.assert_status(StatusCode::FORBIDDEN);
+        resp.assert_text("E2E_REQUIRED").await;
+
+        // (b) Initialized Bot -> another Bot: Bot-to-Bot is NOT intercepted
+        // (Bot conversations with the *target* Bot are that Bot's inbound
+        // concern, not the sender's transparent-encryption path). Falls
+        // through to the normal path -> E2E_REQUIRED.
+        let sender_bot = create_bot(&server, &admin, "http-sender-bot@voce.chat").await;
+        initialize(server.state(), 1, sender_bot).await.unwrap();
+        let sender_key = create_bot_api_key(&server, &admin, sender_bot).await;
+        let other_bot = create_bot(&server, &admin, "http-other-bot@voce.chat").await;
+
+        let resp = server
+            .post(format!("/api/bot/send_to_user/{other_bot}"))
+            .header("x-api-key", &sender_key)
+            .content_type("text/plain")
+            .body("bot to bot")
+            .send()
+            .await;
+        resp.assert_status(StatusCode::FORBIDDEN);
+        resp.assert_text("E2E_REQUIRED").await;
+    }
+
+    // -- IMPORTANT 2: atomic OTP consumption -----------------------------
+
+    #[tokio::test]
+    async fn concurrent_otp_consumes_never_share_an_id() {
+        let key = test_master_key();
+        let _guard = set_master_key_env(&key);
+        let server = TestServer::new().await;
+        let admin = server.login_admin().await;
+        let target_uid = server.create_user(&admin, "otp-race-target@voce.chat").await;
+        let token = server
+            .login_with_device("otp-race-target@voce.chat", "phone-1")
+            .await;
+        publish_deferred_identity(&server, &token, "phone-1").await;
+        for key_id in 1..=4 {
+            insert_valid_otp(&server.state().db_pool, target_uid, "phone-1", key_id).await;
+        }
+
+        let device = fetch_one_device(&server.state().db_pool, target_uid, "phone-1")
+            .await
+            .unwrap()
+            .expect("device is deferred-capable");
+        let content_key = [5u8; 32];
+
+        // Two concurrent wraps against the same OTP pool. The atomic
+        // `and consumed = false` claim + retry must hand each a distinct OTP
+        // id; neither may reuse the other's prekey.
+        let (r1, r2) = tokio::join!(
+            wrap_content_key_for_device(&server.state().db_pool, &content_key, &device),
+            wrap_content_key_for_device(&server.state().db_pool, &content_key, &device),
+        );
+        let e1 = r1.unwrap().expect("wrap 1 produced an envelope");
+        let e2 = r2.unwrap().expect("wrap 2 produced an envelope");
+        let id1 = e1.x3dh_initial.used_one_time_prekey_id;
+        let id2 = e2.x3dh_initial.used_one_time_prekey_id;
+        assert!(id1.is_some() && id2.is_some(), "both wraps should use an OTP");
+        assert_ne!(id1, id2, "two concurrent consumes must not share an OTP id");
+
+        // Exactly two OTPs were consumed.
+        let consumed: i64 = sqlx::query_scalar(
+            "select count(*) from e2e_prekey where uid = ? and device_id = ? and consumed = true",
+        )
+        .bind(target_uid)
+        .bind("phone-1")
+        .fetch_one(&server.state().db_pool)
+        .await
+        .unwrap();
+        assert_eq!(consumed, 2);
+    }
+
+    #[tokio::test]
+    async fn try_consume_one_time_prekey_is_single_winner() {
+        let key = test_master_key();
+        let _guard = set_master_key_env(&key);
+        let server = TestServer::new().await;
+        let admin = server.login_admin().await;
+        let uid = server.create_user(&admin, "otp-guard@voce.chat").await;
+        let token = server.login_with_device("otp-guard@voce.chat", "phone-1").await;
+        publish_deferred_identity(&server, &token, "phone-1").await;
+        insert_valid_otp(&server.state().db_pool, uid, "phone-1", 1).await;
+
+        let (id, _, _) = peek_one_time_prekey(&server.state().db_pool, uid, "phone-1")
+            .await
+            .unwrap()
+            .unwrap();
+        // First claim wins; second claim of the same id loses (guard works).
+        assert!(try_consume_one_time_prekey(&server.state().db_pool, id).await.unwrap());
+        assert!(!try_consume_one_time_prekey(&server.state().db_pool, id).await.unwrap());
+    }
+
+    // -- IMPORTANT 3: failed wrap must not burn an OTP -------------------
+
+    #[tokio::test]
+    async fn failed_wrap_does_not_consume_otp() {
+        let key = test_master_key();
+        let _guard = set_master_key_env(&key);
+        let server = TestServer::new().await;
+        let admin = server.login_admin().await;
+        let target_uid = server.create_user(&admin, "otp-wrapfail-target@voce.chat").await;
+        let token = server
+            .login_with_device("otp-wrapfail-target@voce.chat", "phone-1")
+            .await;
+        publish_deferred_identity(&server, &token, "phone-1").await;
+        // A single, corrupt OTP whose public key cannot be X3DH-decoded, so
+        // `deferred_wrap_key` fails.
+        sqlx::query(
+            "insert into e2e_prekey (uid, device_id, key_id, public_key, consumed) values (?, ?, ?, ?, false)",
+        )
+        .bind(target_uid)
+        .bind("phone-1")
+        .bind(1_i32)
+        .bind("!!!not-a-valid-x25519-public-key!!!")
+        .execute(&server.state().db_pool)
+        .await
+        .unwrap();
+
+        let device = fetch_one_device(&server.state().db_pool, target_uid, "phone-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let content_key = [9u8; 32];
+        let result = wrap_content_key_for_device(&server.state().db_pool, &content_key, &device)
+            .await
+            .unwrap();
+        assert!(result.is_none(), "wrap over a corrupt OTP must fail (None)");
+
+        // The corrupt OTP must remain UNCONSUMED (a failed wrap must not
+        // shrink the target's prekey pool).
+        let consumed: i64 = sqlx::query_scalar(
+            "select count(*) from e2e_prekey where uid = ? and device_id = ? and consumed = true",
+        )
+        .bind(target_uid)
+        .bind("phone-1")
+        .fetch_one(&server.state().db_pool)
+        .await
+        .unwrap();
+        assert_eq!(consumed, 0, "failed wrap must not consume the OTP");
+    }
+
+    // -- MINOR 5: restart-restore ----------------------------------------
+
+    #[tokio::test]
+    async fn restart_restore_reopens_vault_from_disk() {
+        let key = test_master_key();
+        let _guard = set_master_key_env(&key);
+        let server = TestServer::new().await;
+        let admin = server.login_admin().await;
+        let bot_uid = create_bot(&server, &admin, "restart-bot@voce.chat").await;
+        initialize(server.state(), 1, bot_uid).await.unwrap();
+
+        // Simulate a process restart: open a brand-new pool against the same
+        // on-disk sqlite file, with no shared in-process state.
+        let path = server.state().config.system.sqlite_filename();
+        let dsn = format!("sqlite:{}", path.display());
+        let fresh_pool = sqlx::SqlitePool::connect(&dsn).await.unwrap();
+
+        let row = load_identity_row(&fresh_pool, bot_uid).await.unwrap();
+        assert!(row.is_some(), "vault identity row must survive a restart");
+        assert_eq!(row.as_ref().unwrap().key_version, 1);
+
+        // The encrypted material still decrypts with the master key and
+        // yields a well-formed identity.
+        let material = load_and_decrypt_material(&fresh_pool, bot_uid, &key)
+            .await
+            .unwrap();
+        let identity = IdentitySecret {
+            x25519: material.identity_x25519,
+            ed25519: material.identity_ed25519,
+        };
+        assert!(identity.public().is_ok());
+        fresh_pool.close().await;
     }
 }
