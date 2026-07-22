@@ -788,21 +788,30 @@ impl ApiUser {
             .get_mut(&token.uid)
             .ok_or_else(|| Error::from(StatusCode::UNAUTHORIZED))?;
 
-        if cached_user.password.as_deref().unwrap_or_default() != &*req.old_password {
+        let old_password_matches = match cached_user.password.as_deref() {
+            Some(stored) => crate::password_hash::verify_and_upgrade(&req.old_password, stored).matched,
+            None => false,
+        };
+        if !old_password_matches {
             return Err(Error::from(StatusCode::FORBIDDEN));
         }
+
+        // Always store the new password as Argon2id, regardless of what
+        // scheme the old one used.
+        let new_password_hash =
+            crate::password_hash::hash(&req.new_password).map_err(InternalServerError)?;
 
         // update database
         let sql = "update user set password = ? where uid = ?";
         sqlx::query(sql)
-            .bind(&req.new_password)
+            .bind(&new_password_hash)
             .bind(token.uid)
             .execute(&state.db_pool)
             .await
             .map_err(InternalServerError)?;
 
         // update cache
-        cached_user.password = Some(req.0.new_password);
+        cached_user.password = Some(new_password_hash);
         Ok(())
     }
 
@@ -4473,12 +4482,52 @@ mod tests {
         check(&server, &admin_token, uid1, Some(id1), vec![]).await;
     }
 
+    async fn fetch_stored_password(server: &TestServer, uid: i64) -> String {
+        let (password,): (String,) = sqlx::query_as("select password from user where uid = ?")
+            .bind(uid)
+            .fetch_one(&server.state().db_pool)
+            .await
+            .unwrap();
+        password
+    }
+
+    #[tokio::test]
+    async fn test_register_stores_argon2id_password() {
+        let server = TestServer::new().await;
+
+        let resp = server
+            .post("/api/user/register")
+            .body_json(&json!({
+                "email": "newuser@voce.chat",
+                "password": "hunter2000",
+                "gender": 1,
+            }))
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let json = resp.json().await;
+        let uid = json
+            .value()
+            .object()
+            .get("user")
+            .object()
+            .get("uid")
+            .i64();
+
+        let stored = fetch_stored_password(&server, uid).await;
+        assert!(
+            crate::password_hash::looks_like_argon2id(&stored),
+            "expected register to store an Argon2id hash, got: {} chars",
+            stored.len()
+        );
+    }
+
     #[tokio::test]
     async fn test_change_password() {
         let server = TestServer::new().await;
         let admin_token = server.login_admin().await;
 
-        server.create_user(&admin_token, "user1@voce.chat").await;
+        let uid1 = server.create_user(&admin_token, "user1@voce.chat").await;
         let token1 = server.login("user1@voce.chat").await;
 
         server
@@ -4491,6 +4540,26 @@ mod tests {
             .send()
             .await
             .assert_status_is_ok();
+
+        // new password is stored as Argon2id, not plaintext.
+        let stored = fetch_stored_password(&server, uid1).await;
+        assert!(
+            crate::password_hash::looks_like_argon2id(&stored),
+            "expected change_password to store an Argon2id hash, got: {} chars",
+            stored.len()
+        );
+
+        // wrong old_password is rejected.
+        server
+            .post("/api/user/change_password")
+            .header("X-API-Key", &token1)
+            .body_json(&json!({
+                "old_password": "not-the-old-password",
+                "new_password": "whatever",
+            }))
+            .send()
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
 
         let resp = server
             .post("/api/token/login")
