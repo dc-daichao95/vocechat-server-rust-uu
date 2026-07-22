@@ -641,20 +641,43 @@ impl ApiToken {
                 if login_cfg.password =>
             {
                 let email = email.to_lowercase();
-                let cache = state.cache.read().await;
-                let uid = match cache
-                    .users
-                    .iter()
-                    .find(|(_, user)| user.email.as_ref() == Some(&email))
-                {
-                    Some((uid, cached_user)) => {
-                        if cached_user.password.as_ref() != Some(&password) {
-                            return Ok(LoginApiResponse::InvalidAccount);
-                        }
-                        *uid
+                let (uid, verify_outcome) = {
+                    let cache = state.cache.read().await;
+                    match cache
+                        .users
+                        .iter()
+                        .find(|(_, user)| user.email.as_ref() == Some(&email))
+                    {
+                        Some((uid, cached_user)) => match cached_user.password.as_deref() {
+                            Some(stored) => {
+                                (*uid, crate::password_hash::verify_and_upgrade(&password, stored))
+                            }
+                            // No password set for this account (e.g. OAuth-only) -
+                            // password login can never succeed.
+                            None => return Ok(LoginApiResponse::InvalidAccount),
+                        },
+                        None => return Ok(LoginApiResponse::UserDoesNotExist),
                     }
-                    None => return Ok(LoginApiResponse::UserDoesNotExist),
                 };
+                if !verify_outcome.matched {
+                    return Ok(LoginApiResponse::InvalidAccount);
+                }
+                // Best-effort upgrade of legacy (double-MD5 or plaintext)
+                // stored passwords to Argon2id. Login must still succeed even
+                // if this persistence step fails.
+                if let Some(upgraded_hash) = verify_outcome.upgraded_hash {
+                    if sqlx::query("update user set password = ? where uid = ?")
+                        .bind(&upgraded_hash)
+                        .bind(uid)
+                        .execute(&state.db_pool)
+                        .await
+                        .is_ok()
+                    {
+                        if let Some(cached_user) = state.cache.write().await.users.get_mut(&uid) {
+                            cached_user.password = Some(upgraded_hash);
+                        }
+                    }
+                }
                 uid
             }
 
@@ -1799,6 +1822,133 @@ mod tests {
                 .uid,
             1
         );
+    }
+
+    async fn fetch_stored_password(server: &TestServer, uid: i64) -> String {
+        let (password,): (String,) = sqlx::query_as("select password from user where uid = ?")
+            .bind(uid)
+            .fetch_one(&server.state().db_pool)
+            .await
+            .unwrap();
+        password
+    }
+
+    /// Simulate an account whose DB row still has the historical
+    /// `MD5(MD5(plaintext))` hex value in the `password` column (both in the
+    /// DB and in the in-memory cache, mirroring what `load_users_cache`
+    /// would have loaded from such a row at startup).
+    async fn make_user_have_legacy_double_md5_password(
+        server: &TestServer,
+        uid: i64,
+        plaintext: &str,
+    ) -> String {
+        let legacy_hash = crate::password_hash::double_md5_hex(plaintext);
+        sqlx::query("update user set password = ? where uid = ?")
+            .bind(&legacy_hash)
+            .bind(uid)
+            .execute(&server.state().db_pool)
+            .await
+            .unwrap();
+        server
+            .state()
+            .cache
+            .write()
+            .await
+            .users
+            .get_mut(&uid)
+            .unwrap()
+            .password = Some(legacy_hash.clone());
+        legacy_hash
+    }
+
+    #[tokio::test]
+    async fn test_login_with_legacy_double_md5_password_upgrades_to_argon2id() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin().await;
+        let uid = server.create_user(&admin_token, "legacy@voce.chat").await;
+
+        // Historical plaintext -> MD5(MD5(...)) test vector from old_data:
+        // "dc950713" -> a75fc917c14138b831247f93fc38bb0b.
+        let legacy_hash =
+            make_user_have_legacy_double_md5_password(&server, uid, "dc950713").await;
+        assert_eq!(legacy_hash, "a75fc917c14138b831247f93fc38bb0b");
+        assert!(crate::password_hash::looks_like_double_md5(&legacy_hash));
+
+        // Login with the ORIGINAL PLAINTEXT succeeds.
+        let resp = server
+            .post("/api/token/login")
+            .body_json(&json!({
+                "credential": {
+                    "type": "password",
+                    "email": "legacy@voce.chat",
+                    "password": "dc950713",
+                },
+                "device": "iphone",
+                "device_token": "test",
+            }))
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+
+        // The stored value has been upgraded to Argon2id, both in the DB...
+        let stored = fetch_stored_password(&server, uid).await;
+        assert!(
+            crate::password_hash::looks_like_argon2id(&stored),
+            "expected DB password column to be upgraded to Argon2id"
+        );
+        // ...and in the in-memory cache used by subsequent logins.
+        {
+            let cache = server.state().cache.read().await;
+            let cached = cache.users.get(&uid).unwrap().password.as_deref().unwrap();
+            assert!(
+                crate::password_hash::looks_like_argon2id(cached),
+                "expected cached password to be upgraded to Argon2id"
+            );
+        }
+
+        // A second login now succeeds purely via the Argon2id path (no
+        // legacy fallback needed).
+        let resp = server
+            .post("/api/token/login")
+            .body_json(&json!({
+                "credential": {
+                    "type": "password",
+                    "email": "legacy@voce.chat",
+                    "password": "dc950713",
+                },
+                "device": "iphone",
+                "device_token": "test",
+            }))
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+    }
+
+    #[tokio::test]
+    async fn test_login_with_legacy_double_md5_password_rejects_wrong_password() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin().await;
+        let uid = server.create_user(&admin_token, "legacy2@voce.chat").await;
+        make_user_have_legacy_double_md5_password(&server, uid, "dc950713").await;
+
+        let resp = server
+            .post("/api/token/login")
+            .body_json(&json!({
+                "credential": {
+                    "type": "password",
+                    "email": "legacy2@voce.chat",
+                    "password": "totally-wrong",
+                },
+                "device": "iphone",
+                "device_token": "test",
+            }))
+            .send()
+            .await;
+        resp.assert_status(StatusCode::UNAUTHORIZED);
+
+        // stored value is untouched (no upgrade on failed verification).
+        let stored = fetch_stored_password(&server, uid).await;
+        assert!(crate::password_hash::looks_like_double_md5(&stored));
     }
 
     #[tokio::test]
