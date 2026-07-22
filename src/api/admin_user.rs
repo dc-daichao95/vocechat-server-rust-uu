@@ -276,6 +276,18 @@ impl ApiAdminUser {
             return Err(Error::from_status(StatusCode::BAD_REQUEST));
         }
 
+        // Admin-set passwords are always stored as Argon2id. Compute the hash
+        // BEFORE acquiring the cache lock so the CPU/memory-hard Argon2id work
+        // never runs while holding the global cache lock (DoS).
+        let new_password_hash = match &req.password {
+            Some(plaintext) => Some(
+                crate::password_hash::hash_async(plaintext.clone())
+                    .await
+                    .map_err(InternalServerError)?,
+            ),
+            None => None,
+        };
+
         let mut cache = state.cache.write().await;
 
         if let Some(email) = &req.email {
@@ -310,14 +322,6 @@ impl ApiAdminUser {
             .users
             .get_mut(&uid.0)
             .ok_or_else(|| Error::from(StatusCode::NOT_FOUND))?;
-
-        // Admin-set passwords are always stored as Argon2id.
-        let new_password_hash = match &req.password {
-            Some(plaintext) => {
-                Some(crate::password_hash::hash(plaintext).map_err(InternalServerError)?)
-            }
-            None => None,
-        };
 
         // begin transaction
         let mut tx = state.db_pool.begin().await.map_err(InternalServerError)?;

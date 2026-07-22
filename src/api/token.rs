@@ -641,7 +641,13 @@ impl ApiToken {
                 if login_cfg.password =>
             {
                 let email = email.to_lowercase();
-                let (uid, verify_outcome) = {
+                // Capture the uid and the stored credential out of the cache,
+                // then DROP the read lock before doing any Argon2id work. The
+                // CPU/memory-hard verify must not run while holding the global
+                // cache lock (DoS), and dropping the read lock here also lets
+                // the best-effort upgrade below reacquire a write lock without
+                // RwLock reentrancy/deadlock.
+                let (uid, stored) = {
                     let cache = state.cache.read().await;
                     match cache
                         .users
@@ -649,9 +655,7 @@ impl ApiToken {
                         .find(|(_, user)| user.email.as_ref() == Some(&email))
                     {
                         Some((uid, cached_user)) => match cached_user.password.as_deref() {
-                            Some(stored) => {
-                                (*uid, crate::password_hash::verify_and_upgrade(&password, stored))
-                            }
+                            Some(stored) => (*uid, stored.to_owned()),
                             // No password set for this account (e.g. OAuth-only) -
                             // password login can never succeed.
                             None => return Ok(LoginApiResponse::InvalidAccount),
@@ -659,6 +663,8 @@ impl ApiToken {
                         None => return Ok(LoginApiResponse::UserDoesNotExist),
                     }
                 };
+                let verify_outcome =
+                    crate::password_hash::verify_and_upgrade_async(password, stored).await;
                 if !verify_outcome.matched {
                     return Ok(LoginApiResponse::InvalidAccount);
                 }
@@ -1949,6 +1955,64 @@ mod tests {
         // stored value is untouched (no upgrade on failed verification).
         let stored = fetch_stored_password(&server, uid).await;
         assert!(crate::password_hash::looks_like_double_md5(&stored));
+    }
+
+    #[tokio::test]
+    async fn test_login_with_stored_hash_string_as_password_is_rejected() {
+        // SECURITY regression (account-takeover bypass): for a legacy
+        // double-MD5 account, an attacker who has read the stored hash from a
+        // DB dump must NOT be able to log in by submitting that hash string
+        // itself as the password. The real plaintext must still work + upgrade.
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin().await;
+        let uid = server.create_user(&admin_token, "legacy3@voce.chat").await;
+        let legacy_hash =
+            make_user_have_legacy_double_md5_password(&server, uid, "dc950713").await;
+        assert_eq!(legacy_hash, "a75fc917c14138b831247f93fc38bb0b");
+
+        // Attacker submits the STORED HASH STRING as the password -> 401.
+        let resp = server
+            .post("/api/token/login")
+            .body_json(&json!({
+                "credential": {
+                    "type": "password",
+                    "email": "legacy3@voce.chat",
+                    "password": legacy_hash,
+                },
+                "device": "iphone",
+                "device_token": "test",
+            }))
+            .send()
+            .await;
+        resp.assert_status(StatusCode::UNAUTHORIZED);
+
+        // The stored value is untouched (no takeover-upgrade happened).
+        let stored = fetch_stored_password(&server, uid).await;
+        assert!(
+            crate::password_hash::looks_like_double_md5(&stored),
+            "stored credential must not have been rewritten by a rejected login"
+        );
+
+        // The genuine plaintext still logs in and upgrades to Argon2id.
+        let resp = server
+            .post("/api/token/login")
+            .body_json(&json!({
+                "credential": {
+                    "type": "password",
+                    "email": "legacy3@voce.chat",
+                    "password": "dc950713",
+                },
+                "device": "iphone",
+                "device_token": "test",
+            }))
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let stored = fetch_stored_password(&server, uid).await;
+        assert!(
+            crate::password_hash::looks_like_argon2id(&stored),
+            "real plaintext login should upgrade the stored credential to Argon2id"
+        );
     }
 
     #[tokio::test]

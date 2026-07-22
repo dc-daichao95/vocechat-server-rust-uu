@@ -15,6 +15,18 @@
 //! Nothing in this module ever logs the plaintext password or the hash
 //! material; functions return plain booleans/strings for the caller to use,
 //! and no `tracing`/`println` calls are made here.
+//!
+//! # Timing
+//!
+//! The legacy comparisons in [`verify_and_upgrade`] (the double-MD5 digest
+//! comparison and the raw-plaintext equality fallback) use ordinary `==`
+//! string comparison and are therefore **not constant-time**. This is an
+//! accepted trade-off: the HTTP login/change-password endpoints already
+//! reveal the match/no-match result to the caller, so a timing side channel
+//! does not leak anything the response itself does not. Argon2id
+//! verification (the steady-state path once every credential is migrated)
+//! goes through the `argon2`/`password-hash` crates, whose verifier does use
+//! a constant-time tag comparison.
 
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -122,8 +134,21 @@ pub fn verify_and_upgrade(plaintext: &str, stored: &str) -> VerifyAndUpgrade {
         };
     }
 
-    let legacy_match =
-        (looks_like_double_md5(stored) && double_md5_hex(plaintext) == stored) || stored == plaintext;
+    // SECURITY: if `stored` already looks like a recognized hash format
+    // (here: a legacy double-MD5 digest), the ONLY accepted proof is the
+    // plaintext whose double-MD5 equals it. We must NOT fall through to
+    // `stored == plaintext`, because that would let an attacker who has read
+    // the stored hash (from a DB dump / backup) authenticate by submitting
+    // the hash string itself as the "password" — and the subsequent upgrade
+    // would then persist Argon2id(hash-string), a durable account takeover.
+    // The raw plaintext-equality fallback is reserved for values that are
+    // neither Argon2id (early-returned above) nor double-MD5 shaped, i.e.
+    // genuinely still-plaintext legacy rows.
+    let legacy_match = if looks_like_double_md5(stored) {
+        double_md5_hex(plaintext) == stored
+    } else {
+        stored == plaintext
+    };
 
     if legacy_match {
         VerifyAndUpgrade {
@@ -139,6 +164,36 @@ pub fn verify_and_upgrade(plaintext: &str, stored: &str) -> VerifyAndUpgrade {
             upgraded_hash: None,
         }
     }
+}
+
+/// Async wrapper around [`hash`] that offloads the CPU/memory-hard Argon2id
+/// computation to a blocking thread via `tokio::task::spawn_blocking`, so it
+/// never monopolizes an async runtime worker (a DoS risk under concurrent
+/// logins/registrations).
+///
+/// Callers must NOT hold any lock (e.g. the global `state.cache` `RwLock`)
+/// across this call.
+pub async fn hash_async(password: String) -> Result<String, HashError> {
+    tokio::task::spawn_blocking(move || hash(&password))
+        .await
+        .map_err(|_| HashError)?
+}
+
+/// Async wrapper around [`verify_and_upgrade`] that offloads the Argon2id
+/// verify + (on a legacy match) the Argon2id upgrade hash to a blocking
+/// thread via `tokio::task::spawn_blocking`.
+///
+/// Callers must NOT hold any lock across this call; capture the `stored`
+/// value out of the cache first, release the lock, then verify.
+pub async fn verify_and_upgrade_async(plaintext: String, stored: String) -> VerifyAndUpgrade {
+    tokio::task::spawn_blocking(move || verify_and_upgrade(&plaintext, &stored))
+        .await
+        // A join error (blocking pool panic/shutdown) is treated as a
+        // non-match; login/verification simply fails safe.
+        .unwrap_or(VerifyAndUpgrade {
+            matched: false,
+            upgraded_hash: None,
+        })
 }
 
 #[cfg(test)]
@@ -199,6 +254,20 @@ mod tests {
         let stored = double_md5_hex("dc950713");
         let outcome = verify_and_upgrade("wrong-password", &stored);
         assert!(!outcome.matched);
+        assert!(outcome.upgraded_hash.is_none());
+    }
+
+    #[test]
+    fn verify_and_upgrade_rejects_stored_hash_as_password_for_legacy_double_md5() {
+        // SECURITY regression: submitting the STORED double-MD5 hash string
+        // itself as the password must NOT authenticate. Only the real
+        // plaintext (whose double-MD5 equals `stored`) may match.
+        let stored = double_md5_hex("dc950713");
+        let outcome = verify_and_upgrade(&stored, &stored);
+        assert!(
+            !outcome.matched,
+            "submitting the stored hash as the password must be rejected"
+        );
         assert!(outcome.upgraded_hash.is_none());
     }
 

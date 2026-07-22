@@ -782,26 +782,39 @@ impl ApiUser {
         token: Token,
         req: Json<ChangePasswordRequest>,
     ) -> Result<()> {
-        let mut cache = state.cache.write().await;
-        let cached_user = cache
-            .users
-            .get_mut(&token.uid)
-            .ok_or_else(|| Error::from(StatusCode::UNAUTHORIZED))?;
-
-        let old_password_matches = match cached_user.password.as_deref() {
-            Some(stored) => crate::password_hash::verify_and_upgrade(&req.old_password, stored).matched,
-            None => false,
+        // Capture the stored credential under a short read lock, then release
+        // it before doing any Argon2id work (verify + new hash). The
+        // CPU/memory-hard operations must not run while holding the global
+        // cache lock (DoS).
+        let stored = {
+            let cache = state.cache.read().await;
+            let cached_user = cache
+                .users
+                .get(&token.uid)
+                .ok_or_else(|| Error::from(StatusCode::UNAUTHORIZED))?;
+            match cached_user.password.as_deref() {
+                Some(stored) => stored.to_owned(),
+                // No password set (e.g. OAuth-only account): the old-password
+                // check can never succeed.
+                None => return Err(Error::from(StatusCode::FORBIDDEN)),
+            }
         };
+
+        let old_password_matches =
+            crate::password_hash::verify_and_upgrade_async(req.old_password.clone(), stored)
+                .await
+                .matched;
         if !old_password_matches {
             return Err(Error::from(StatusCode::FORBIDDEN));
         }
 
         // Always store the new password as Argon2id, regardless of what
         // scheme the old one used.
-        let new_password_hash =
-            crate::password_hash::hash(&req.new_password).map_err(InternalServerError)?;
+        let new_password_hash = crate::password_hash::hash_async(req.new_password.clone())
+            .await
+            .map_err(InternalServerError)?;
 
-        // update database
+        // update database (DB before cache for consistency)
         let sql = "update user set password = ? where uid = ?";
         sqlx::query(sql)
             .bind(&new_password_hash)
@@ -810,8 +823,10 @@ impl ApiUser {
             .await
             .map_err(InternalServerError)?;
 
-        // update cache
-        cached_user.password = Some(new_password_hash);
+        // update cache under a short write lock
+        if let Some(cached_user) = state.cache.write().await.users.get_mut(&token.uid) {
+            cached_user.password = Some(new_password_hash);
+        }
         Ok(())
     }
 
