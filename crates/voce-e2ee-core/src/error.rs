@@ -10,6 +10,8 @@ pub enum E2eError {
     InvalidKey(String),
     #[error("decryption failed")]
     DecryptFailed,
+    #[error("encryption failed")]
+    EncryptFailed,
     #[error("replay detected (n={0})")]
     Replay(u32),
     #[error("x3dh failed: {0}")]

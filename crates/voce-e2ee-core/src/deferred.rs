@@ -33,6 +33,58 @@
 //! sha256)` per the required interface, while still cryptographically
 //! binding metadata.
 //!
+//! ## MANDATORY caller responsibility: verify the metadata commitment
+//!
+//! `sha256` binds metadata to the ciphertext **only if the recipient
+//! re-derives it from the metadata it actually received** and refuses to use
+//! any transmitted digest blindly. The transport (server) can rewrite the
+//! plaintext `metadata` it relays while leaving `ciphertext`/`nonce`/`sha256`
+//! untouched; AES-GCM would still open successfully, because the AEAD only
+//! knows the 32-byte AAD, not what metadata "should" hash to. A recipient
+//! that trusted the relayed metadata would therefore accept
+//! attacker-controlled `chat_id`/`content_type`/etc.
+//!
+//! To close this, recipients MUST, before trusting any received metadata:
+//! 1. recompute the commitment from the metadata they received —
+//!    [`deferred_metadata_commitment`] (FFI: `deferred_metadata_commitment`),
+//!    or check it directly with [`deferred_verify_metadata`] (FFI:
+//!    `deferred_verify_metadata`); and
+//! 2. compare it against the `sha256` used for decryption (the digest that
+//!    successfully opened the ciphertext), rejecting the message on
+//!    mismatch.
+//!
+//! Only the digest that both (a) opened the AEAD and (b) equals
+//! `commitment(received_metadata)` proves the received metadata is the
+//! metadata the sender bound. Never trust a transmitted digest without
+//! recomputing it from the received metadata.
+//!
+//! ## MANDATORY caller responsibility: replay / freshness
+//!
+//! This crate provides **no replay defense** for deferred envelopes — unlike
+//! the Double Ratchet path, unwrapping/decrypting is a pure, repeatable
+//! function with no per-message state. A captured `(ciphertext, envelope,
+//! sha256, metadata)` tuple decrypts identically every time it is delivered.
+//! Callers therefore MUST:
+//! - include a unique-per-message field (message id and/or timestamp) inside
+//!   `metadata`, so it enters the `sha256` AAD commitment and cannot be
+//!   altered without detection; and
+//! - enforce message-id uniqueness / freshness upstream (reject a message id
+//!   already seen, and/or reject stale timestamps).
+//!
+//! ## SECURITY: envelopes are NOT sender-authenticated ("sealed sender")
+//!
+//! [`deferred_wrap_key`] wraps the content key using a throwaway, unverified
+//! sender identity (see below). It follows that **anyone in possession of the
+//! recipient's public `PreKeyBundle` can forge a well-formed envelope that
+//! the recipient will happily unwrap.** `deferred_unwrap_key` succeeding
+//! proves only "someone who had my public bundle wrapped this for me" — it
+//! proves nothing about *who*. Sender authorization is therefore a hard
+//! requirement that MUST be enforced at another layer (Task 5/7 clients + the
+//! server): the enclosing message/route must authenticate the sender (e.g.
+//! authenticated API + the outer message envelope's sender identity), and
+//! that authenticated sender identity must be reflected inside `metadata` so
+//! it is bound by the commitment and cross-checked on receipt.
+//!
 //! ## Key wrapping
 //!
 //! [`deferred_wrap_key`] / [`deferred_unwrap_key`] reuse the crate's
@@ -136,6 +188,44 @@ fn canonical_metadata_bytes(metadata: &serde_json::Value) -> Result<Vec<u8>, E2e
     serde_json::to_vec(metadata).map_err(E2eError::from)
 }
 
+/// Deterministic commitment to `metadata`: `SHA-256(canonical JSON)`. This is
+/// the exact value returned as `DeferredEncrypted::sha256` and used as the
+/// AES-GCM AAD. Recipients call this to re-derive the commitment from the
+/// metadata they actually received and compare it against the digest that
+/// decrypted the message (see the "verify the metadata commitment" section in
+/// the module docs). Order-independent for JSON objects.
+pub fn deferred_metadata_commitment(
+    metadata: &serde_json::Value,
+) -> Result<[u8; KEY_LEN], E2eError> {
+    let bytes = canonical_metadata_bytes(metadata)?;
+    let mut sha256 = [0u8; KEY_LEN];
+    sha256.copy_from_slice(&Sha256::digest(&bytes));
+    Ok(sha256)
+}
+
+/// Constant-time-ish equality for two 32-byte commitments. The commitment is
+/// public (not secret), so timing is not truly sensitive; we still avoid an
+/// early-exit compare to keep the verification path uniform.
+fn ct_eq(a: &[u8; KEY_LEN], b: &[u8; KEY_LEN]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..KEY_LEN {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Verify that `metadata` matches a `sha256` commitment. Recipients pass the
+/// metadata they received and the `sha256` that decrypted the ciphertext;
+/// `true` proves the received metadata is exactly what the sender bound.
+/// Never trust a transmitted digest without recomputing it here from the
+/// received metadata.
+pub fn deferred_verify_metadata(
+    metadata: &serde_json::Value,
+    sha256: &[u8; KEY_LEN],
+) -> Result<bool, E2eError> {
+    Ok(ct_eq(&deferred_metadata_commitment(metadata)?, sha256))
+}
+
 fn decode_fixed(b64: &str, len: usize, what: &str) -> Result<Vec<u8>, E2eError> {
     let bytes = B64
         .decode(b64)
@@ -160,9 +250,7 @@ pub fn deferred_encrypt(
     body: &[u8],
     metadata: &serde_json::Value,
 ) -> Result<DeferredEncrypted, E2eError> {
-    let metadata_bytes = canonical_metadata_bytes(metadata)?;
-    let mut sha256 = [0u8; KEY_LEN];
-    sha256.copy_from_slice(&Sha256::digest(&metadata_bytes));
+    let sha256 = deferred_metadata_commitment(metadata)?;
 
     let mut content_key = [0u8; KEY_LEN];
     OsRng.fill_bytes(&mut content_key);
@@ -179,7 +267,7 @@ pub fn deferred_encrypt(
                 aad: &sha256,
             },
         )
-        .map_err(|_| E2eError::DecryptFailed)?;
+        .map_err(|_| E2eError::EncryptFailed)?;
 
     Ok(DeferredEncrypted {
         content_key,
@@ -246,7 +334,7 @@ pub fn deferred_wrap_key(
                 aad: WRAP_AAD,
             },
         )
-        .map_err(|_| E2eError::DecryptFailed)?;
+        .map_err(|_| E2eError::EncryptFailed)?;
     wrap_key.zeroize();
 
     Ok(DeferredEnvelope {

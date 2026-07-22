@@ -12,8 +12,8 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 
 use crate::deferred::{
-    deferred_decrypt, deferred_encrypt, deferred_unwrap_key, deferred_wrap_key,
-    DeferredEnvelope, DeferredLocalIdentity,
+    deferred_decrypt, deferred_encrypt, deferred_metadata_commitment, deferred_unwrap_key,
+    deferred_verify_metadata, deferred_wrap_key, DeferredEnvelope, DeferredLocalIdentity,
 };
 use crate::envelope::EnvelopeV2;
 use crate::identity::{decode_x25519_pub, safety_number, IdentityPublic, IdentitySecret};
@@ -65,6 +65,8 @@ pub fn dispatch(method: &str, args: &Value) -> String {
         "deferred_decrypt" => deferred_decrypt_ffi(args),
         "deferred_wrap_key" => deferred_wrap_key_ffi(args),
         "deferred_unwrap_key" => deferred_unwrap_key_ffi(args),
+        "deferred_metadata_commitment" => deferred_metadata_commitment_ffi(args),
+        "deferred_verify_metadata" => deferred_verify_metadata_ffi(args),
         method
             if method.starts_with("mls_")
                 || matches!(
@@ -358,12 +360,26 @@ fn body_bytes(args: &Value) -> Result<Vec<u8>, String> {
     Ok(args["body"].as_str().unwrap_or("").as_bytes().to_vec())
 }
 
+/// Require an explicit `metadata` field. Omitting it is a caller bug (it
+/// would silently bind `null` as the commitment), so surface an error rather
+/// than mask it. `null` must be passed explicitly if a caller genuinely wants
+/// empty metadata.
+fn require_metadata(args: &Value) -> Result<Value, String> {
+    match args.get("metadata") {
+        Some(v) => Ok(v.clone()),
+        None => Err("missing metadata".to_string()),
+    }
+}
+
 fn deferred_encrypt_ffi(args: &Value) -> String {
     let body = match body_bytes(args) {
         Ok(b) => b,
         Err(e) => return err(e),
     };
-    let metadata = args["metadata"].clone();
+    let metadata = match require_metadata(args) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
     match deferred_encrypt(&body, &metadata) {
         Ok(enc) => ok(json!({
             "content_key_b64": B64.encode(enc.content_key),
@@ -371,6 +387,32 @@ fn deferred_encrypt_ffi(args: &Value) -> String {
             "ciphertext_b64": B64.encode(&enc.ciphertext),
             "sha256_b64": B64.encode(enc.sha256),
         })),
+        Err(e) => err(e),
+    }
+}
+
+fn deferred_metadata_commitment_ffi(args: &Value) -> String {
+    let metadata = match require_metadata(args) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    match deferred_metadata_commitment(&metadata) {
+        Ok(sha256) => ok(json!({ "sha256_b64": B64.encode(sha256) })),
+        Err(e) => err(e),
+    }
+}
+
+fn deferred_verify_metadata_ffi(args: &Value) -> String {
+    let metadata = match require_metadata(args) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let sha256 = match decode32(args, "sha256_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    match deferred_verify_metadata(&metadata, &sha256) {
+        Ok(matches) => ok(json!({ "matches": matches })),
         Err(e) => err(e),
     }
 }

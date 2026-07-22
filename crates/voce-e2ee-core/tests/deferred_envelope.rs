@@ -8,8 +8,8 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::json;
 
 use voce_e2ee_core::deferred::{
-    deferred_decrypt, deferred_encrypt, deferred_unwrap_key, deferred_wrap_key,
-    DeferredLocalIdentity, DEFERRED_ALG,
+    deferred_decrypt, deferred_encrypt, deferred_metadata_commitment, deferred_unwrap_key,
+    deferred_verify_metadata, deferred_wrap_key, DeferredLocalIdentity, DEFERRED_ALG,
 };
 use voce_e2ee_core::ffi;
 use voce_e2ee_core::identity::IdentitySecret;
@@ -139,6 +139,44 @@ fn duplicate_envelope_unwrap_is_idempotent() {
 }
 
 #[test]
+fn metadata_commitment_matches_encrypt_output() {
+    let metadata = sample_metadata();
+    let enc = deferred_encrypt(b"body", &metadata).unwrap();
+    // The recipient re-derives the commitment from the metadata it received.
+    let recomputed = deferred_metadata_commitment(&metadata).unwrap();
+    assert_eq!(recomputed, enc.sha256);
+    assert!(deferred_verify_metadata(&metadata, &enc.sha256).unwrap());
+}
+
+#[test]
+fn spoofed_metadata_detected_even_when_ciphertext_and_sha256_are_valid() {
+    // Threat model: a compromised server keeps the sender's real
+    // ciphertext/nonce/sha256 (so `deferred_decrypt` still succeeds) but
+    // rewrites the plaintext `metadata` it relays. The recipient MUST catch
+    // this by recomputing the commitment from the *received* metadata.
+    let real_metadata = sample_metadata();
+    let enc = deferred_encrypt(b"body", &real_metadata).unwrap();
+
+    // Decryption of the (untouched) ciphertext still works with the real
+    // digest — decryption alone does NOT protect metadata.
+    assert!(deferred_decrypt(&enc.ciphertext, &enc.content_key, &enc.nonce, &enc.sha256).is_ok());
+
+    // Attacker-relayed metadata differs from what the sender bound.
+    let spoofed_metadata = json!({
+        "chat_id": 999,               // <- rewritten
+        "sender_device_id": "attacker",
+        "content_type": "text/plain",
+    });
+
+    // The caller-facing verification path rejects it.
+    assert!(!deferred_verify_metadata(&spoofed_metadata, &enc.sha256).unwrap());
+    assert_ne!(
+        deferred_metadata_commitment(&spoofed_metadata).unwrap(),
+        enc.sha256
+    );
+}
+
+#[test]
 fn rejects_envelope_with_wrong_algorithm_label() {
     let (bundle, local) = recipient();
     let enc = deferred_encrypt(b"body", &sample_metadata()).unwrap();
@@ -227,6 +265,57 @@ fn ffi_round_trip() {
         b"ffi body"
     );
     assert_eq!(dec["result"]["body"], "ffi body");
+}
+
+#[test]
+fn ffi_verify_metadata_detects_spoof() {
+    let real_metadata = json!({"chat_id": 42, "content_type": "text/plain"});
+    let enc = ffi_call(
+        "deferred_encrypt",
+        &json!({"body_b64": B64.encode(b"ffi body"), "metadata": real_metadata}),
+    );
+    assert_eq!(enc["ok"], true, "{enc}");
+    let sha256_b64 = enc["result"]["sha256_b64"].as_str().unwrap();
+
+    // Commitment method re-derives the same digest from the real metadata.
+    let commit = ffi_call(
+        "deferred_metadata_commitment",
+        &json!({"metadata": real_metadata}),
+    );
+    assert_eq!(commit["ok"], true, "{commit}");
+    assert_eq!(commit["result"]["sha256_b64"], sha256_b64);
+
+    // Genuine metadata verifies true.
+    let ok_verify = ffi_call(
+        "deferred_verify_metadata",
+        &json!({"metadata": real_metadata, "sha256_b64": sha256_b64}),
+    );
+    assert_eq!(ok_verify["ok"], true, "{ok_verify}");
+    assert_eq!(ok_verify["result"]["matches"], true);
+
+    // Spoofed metadata (with the sender's valid sha256) verifies false.
+    let spoof_verify = ffi_call(
+        "deferred_verify_metadata",
+        &json!({
+            "metadata": {"chat_id": 999, "content_type": "text/plain"},
+            "sha256_b64": sha256_b64,
+        }),
+    );
+    assert_eq!(spoof_verify["ok"], true, "{spoof_verify}");
+    assert_eq!(spoof_verify["result"]["matches"], false);
+}
+
+#[test]
+fn ffi_encrypt_requires_metadata_field() {
+    // Omitting `metadata` entirely is a caller bug and must error, not
+    // silently bind `null`.
+    let missing = ffi_call("deferred_encrypt", &json!({"body_b64": B64.encode(b"x")}));
+    assert_eq!(missing["ok"], false, "{missing}");
+
+    // Explicit null is allowed (caller intent is unambiguous).
+    let explicit_null =
+        ffi_call("deferred_encrypt", &json!({"body_b64": B64.encode(b"x"), "metadata": null}));
+    assert_eq!(explicit_null["ok"], true, "{explicit_null}");
 }
 
 #[test]

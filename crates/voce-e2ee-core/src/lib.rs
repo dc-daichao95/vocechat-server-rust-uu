@@ -17,8 +17,9 @@ pub mod ratchet;
 pub mod x3dh;
 
 pub use deferred::{
-    deferred_decrypt, deferred_encrypt, deferred_unwrap_key, deferred_wrap_key, DeferredEncrypted,
-    DeferredEnvelope, DeferredLocalIdentity, DEFERRED_ALG,
+    deferred_decrypt, deferred_encrypt, deferred_metadata_commitment, deferred_unwrap_key,
+    deferred_verify_metadata, deferred_wrap_key, DeferredEncrypted, DeferredEnvelope,
+    DeferredLocalIdentity, DEFERRED_ALG,
 };
 pub use envelope::{E2eVersion, EnvelopeV2, ReplayWindow};
 pub use error::E2eError;
