@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::FromStr};
+use std::str::FromStr;
 
 use chrono::Datelike;
 use futures_util::TryFutureExt;
@@ -14,7 +14,6 @@ use poem_openapi::{
     payload::Json,
     OpenApi,
 };
-use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
 use crate::{
@@ -47,19 +46,54 @@ async fn check_api_key(state: &State, uid: i64, key: &str) -> Result<()> {
     Ok(())
 }
 
-fn reject_deferred_bot_protocol(properties: &Option<HashMap<String, Value>>) -> Result<()> {
-    if properties
-        .as_ref()
-        .and_then(|properties| properties.get("protocol"))
-        .and_then(Value::as_str)
-        == Some("dr-pending")
-    {
-        return Err(Error::from_string(
-            "E2E_BOT_DEFERRED_UNAVAILABLE",
-            StatusCode::BAD_REQUEST,
-        ));
+/// Extract the plaintext body + content-type label for a Bot's plain
+/// (non-E2EE) send, if this is one. Only `Text`/`Markdown` sends are
+/// eligible for transparent server-side encryption today; `File`,
+/// `Archive`, and explicit `E2eV2` sends pass through unchanged.
+fn plain_text_content(req: &SendMessageRequest) -> Option<(&str, &'static str)> {
+    match req {
+        SendMessageRequest::Text(text) => Some((text.0.as_str(), "text/plain")),
+        SendMessageRequest::Markdown(text) => Some((text.0.as_str(), "text/markdown")),
+        _ => None,
     }
-    Ok(())
+}
+
+/// If `current_uid` is a Bot with an initialized E2EE vault and
+/// `target_uid` is a human (not another Bot), transparently encrypt+send
+/// `req`'s plaintext body via the Bot crypto engine (`src/bot_e2ee.rs`)
+/// instead of sending it as plaintext. Returns `None` (falls back to the
+/// existing plaintext path unchanged) when the Bot has not been
+/// initialized, the request isn't plain text/markdown, or the target is
+/// itself a Bot -- Bot conversations are the documented E2EE exception,
+/// generic plaintext-to-plaintext-Bot traffic is unaffected.
+async fn maybe_send_as_managed_bot(
+    state: &State,
+    current_uid: i64,
+    target_uid: i64,
+    req: &SendMessageRequest,
+) -> Result<Option<i64>> {
+    let Some((plaintext, content_type)) = plain_text_content(req) else {
+        return Ok(None);
+    };
+
+    let (is_current_bot, is_target_bot) = {
+        let cache = state.cache.read().await;
+        (
+            cache.users.get(&current_uid).map(|u| u.is_bot).unwrap_or(false),
+            cache.users.get(&target_uid).map(|u| u.is_bot).unwrap_or(false),
+        )
+    };
+    if !is_current_bot || is_target_bot {
+        return Ok(None);
+    }
+    match crate::bot_e2ee::status(state, current_uid).await {
+        Ok(status) if status.initialized => {}
+        _ => return Ok(None),
+    }
+
+    let mid = crate::bot_e2ee::send_bot_dm(state, current_uid, target_uid, content_type, plaintext)
+        .await?;
+    Ok(Some(mid))
 }
 
 pub struct ApiBot;
@@ -98,10 +132,12 @@ impl ApiBot {
         let current_uid = parse_api_key(&api_key, &state.0.key_config.read().await.server_key)
             .ok_or_else(|| Error::from_status(StatusCode::UNAUTHORIZED))?;
         check_api_key(&state, current_uid, &api_key).await?;
-        let properties = parse_properties_from_base64(properties.0);
-        if matches!(&req, SendMessageRequest::E2eV2(_)) {
-            reject_deferred_bot_protocol(&properties)?;
+
+        if let Some(mid) = maybe_send_as_managed_bot(&state, current_uid, uid.0, &req).await? {
+            return Ok(Json(mid));
         }
+
+        let properties = parse_properties_from_base64(properties.0);
         let payload = req
             .into_chat_message_payload(&state, current_uid, MessageTarget::user(uid.0), properties)
             .await?;
@@ -371,20 +407,84 @@ impl ApiBot {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
+    use poem_openapi::payload::PlainText;
     use serde_json::json;
 
-    use super::reject_deferred_bot_protocol;
+    use super::plain_text_content;
+    use crate::{api::message::SendMessageRequest, test_harness::TestServer};
 
     #[test]
-    fn bot_rejects_deferred_dm_protocol_until_managed_bot_support_exists() {
-        let properties = Some(HashMap::from([(
-            "protocol".to_string(),
-            json!("dr-pending"),
-        )]));
-        let error = reject_deferred_bot_protocol(&properties).unwrap_err();
-        assert_eq!(error.status(), poem::http::StatusCode::BAD_REQUEST);
-        assert_eq!(error.to_string(), "E2E_BOT_DEFERRED_UNAVAILABLE");
+    fn plain_text_content_matches_text_and_markdown_only() {
+        assert_eq!(
+            plain_text_content(&SendMessageRequest::Text(PlainText("hi".to_string()))),
+            Some(("hi", "text/plain"))
+        );
+        assert_eq!(
+            plain_text_content(&SendMessageRequest::Markdown(PlainText("# hi".to_string()))),
+            Some(("# hi", "text/markdown"))
+        );
+    }
+
+    /// Task 2 previously made a Bot's `dr-pending` sends REJECT outright.
+    /// Task 4 replaces that guard with the real Bot deferred flow: a Bot
+    /// may now legitimately send `dr-pending` E2EE v2 envelopes it built
+    /// itself (advanced Bot clients), same as any other authenticated
+    /// sender -- the only Bot-specific behavior is the *transparent*
+    /// plaintext-encryption path in `maybe_send_as_managed_bot`, exercised
+    /// end-to-end in `src/bot_e2ee.rs`'s tests.
+    #[tokio::test]
+    async fn bot_dr_pending_send_is_no_longer_rejected() {
+        let server = TestServer::new().await;
+        let admin_token = server.login_admin().await;
+        let bot_uid = {
+            let resp = server
+                .post("/api/admin/user")
+                .header("X-API-Key", &admin_token)
+                .body_json(&json!({
+                    "email": "dr-pending-bot@voce.chat",
+                    "password": "123456",
+                    "name": "dr-pending-bot",
+                    "gender": 1,
+                    "language": "en-US",
+                    "is_admin": false,
+                    "is_bot": true,
+                }))
+                .send()
+                .await;
+            resp.assert_status_is_ok();
+            resp.json().await.value().object().get("uid").i64()
+        };
+        let bot_key: String = {
+            let resp = server
+                .post(format!("/api/admin/user/bot-api-key/{bot_uid}"))
+                .header("X-API-Key", &admin_token)
+                .body_json(&json!({ "name": "primary" }))
+                .send()
+                .await;
+            resp.assert_status_is_ok();
+            resp.json().await.value().string().to_string()
+        };
+        let target_uid = server.create_user(&admin_token, "dr-pending-target@voce.chat").await;
+
+        let properties = json!({
+            "e2e_version": 2,
+            "protocol": "dr-pending",
+            "algorithm": "DEFERRED+AES-GCM",
+            "wire_class": "dr_envelope",
+            "sender_device_id": "bot-client",
+            "local_id": "bot-dr-pending-local-1",
+        });
+        let resp = server
+            .post(format!("/api/bot/send_to_user/{target_uid}"))
+            .header("x-api-key", &bot_key)
+            .header(
+                "X-Properties",
+                base64::encode(serde_json::to_string(&properties).unwrap()),
+            )
+            .content_type(crate::e2ee_v2::CONTENT_TYPE)
+            .body("opaque-bot-built-envelope")
+            .send()
+            .await;
+        resp.assert_status_is_ok();
     }
 }

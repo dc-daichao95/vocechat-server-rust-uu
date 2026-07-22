@@ -18,6 +18,7 @@ use crate::{
         UpdateUserResponse, UserConflict, UserUpdateLog,
     },
     api_key::create_api_key,
+    bot_e2ee::{self, BotE2eeChannelStatus, BotE2eeStatus},
     create_user::{CreateUser, CreateUserBy, CreateUserError},
     state::{BotKey, BroadcastEvent, UserEvent, UserStatus},
     State,
@@ -128,6 +129,19 @@ pub enum DeleteBotApiKeyResponse {
     /// Key not found
     #[oai(status = 404)]
     KeyNotFound,
+}
+
+/// Rebuild request. Rebuilding a Bot's E2EE identity is destructive
+/// (discards all prior keys), so it requires an explicit confirmation.
+#[derive(Debug, Object)]
+pub struct RebuildBotE2eeRequest {
+    pub confirm: bool,
+}
+
+/// Enable/disable a Bot's MLS participation (admission only) in a channel.
+#[derive(Debug, Object)]
+pub struct SetBotE2eeChannelRequest {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Object)]
@@ -624,6 +638,93 @@ impl ApiAdminUser {
                     last_used: bot_key.last_used,
                 })
                 .collect(),
+        ))
+    }
+
+    /// Initialize the server-managed Bot E2EE key vault for a Bot user.
+    /// Fails closed (503) if `VOCECHAT_BOT_E2EE_MASTER_KEY_FILE` is
+    /// missing/invalid; fails with 409 if already initialized (use
+    /// `rotate`/`rebuild` instead).
+    #[oai(path = "/bot-e2ee/:uid/initialize", method = "post")]
+    async fn bot_e2ee_initialize(
+        &self,
+        state: Data<&State>,
+        token: Token,
+        uid: Path<i64>,
+    ) -> Result<Json<BotE2eeStatus>> {
+        if !token.is_admin {
+            return Err(Error::from_status(StatusCode::FORBIDDEN));
+        }
+        Ok(Json(bot_e2ee::initialize(&state, token.uid, uid.0).await?))
+    }
+
+    /// Bot E2EE status: whether initialized, key version, whether the
+    /// master key is currently available, and enabled channels. Never
+    /// includes any secret/private key material.
+    #[oai(path = "/bot-e2ee/:uid/status", method = "get")]
+    async fn bot_e2ee_status(
+        &self,
+        state: Data<&State>,
+        token: Token,
+        uid: Path<i64>,
+    ) -> Result<Json<BotE2eeStatus>> {
+        if !token.is_admin {
+            return Err(Error::from_status(StatusCode::FORBIDDEN));
+        }
+        Ok(Json(bot_e2ee::status(&state, uid.0).await?))
+    }
+
+    /// Rotate a Bot's signed prekey + one-time prekeys (key version += 1).
+    /// The long-term identity is unchanged; existing sessions stay valid.
+    #[oai(path = "/bot-e2ee/:uid/rotate", method = "post")]
+    async fn bot_e2ee_rotate(
+        &self,
+        state: Data<&State>,
+        token: Token,
+        uid: Path<i64>,
+    ) -> Result<Json<BotE2eeStatus>> {
+        if !token.is_admin {
+            return Err(Error::from_status(StatusCode::FORBIDDEN));
+        }
+        Ok(Json(bot_e2ee::rotate(&state, token.uid, uid.0).await?))
+    }
+
+    /// Destructively regenerate a Bot's full E2EE identity (new identity,
+    /// signed prekey, one-time prekeys, MLS credential seed). Requires
+    /// `confirm: true`; otherwise returns 400 with a bilingual
+    /// confirmation-required message.
+    #[oai(path = "/bot-e2ee/:uid/rebuild", method = "post")]
+    async fn bot_e2ee_rebuild(
+        &self,
+        state: Data<&State>,
+        token: Token,
+        uid: Path<i64>,
+        req: Json<RebuildBotE2eeRequest>,
+    ) -> Result<Json<BotE2eeStatus>> {
+        if !token.is_admin {
+            return Err(Error::from_status(StatusCode::FORBIDDEN));
+        }
+        Ok(Json(
+            bot_e2ee::rebuild(&state, token.uid, uid.0, req.confirm).await?,
+        ))
+    }
+
+    /// Enable/disable a Bot's MLS participation (admission only -- see
+    /// `src/bot_e2ee.rs` module docs) in a channel.
+    #[oai(path = "/bot-e2ee/:uid/channel/:gid", method = "put")]
+    async fn bot_e2ee_set_channel(
+        &self,
+        state: Data<&State>,
+        token: Token,
+        uid: Path<i64>,
+        gid: Path<i64>,
+        req: Json<SetBotE2eeChannelRequest>,
+    ) -> Result<Json<BotE2eeChannelStatus>> {
+        if !token.is_admin {
+            return Err(Error::from_status(StatusCode::FORBIDDEN));
+        }
+        Ok(Json(
+            bot_e2ee::set_channel_enabled(&state, token.uid, uid.0, gid.0, req.enabled).await?,
         ))
     }
 }

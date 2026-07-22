@@ -245,6 +245,43 @@ impl ApiE2e {
         .map_err(InternalServerError)?;
         tx.commit().await.map_err(InternalServerError)?;
         if !waiting_senders.is_empty() {
+            // A Bot has no live device/session to react to the broadcast
+            // event below itself, so the server performs the same
+            // deferred-DM catch-up on its behalf (see
+            // `crate::bot_e2ee::catch_up_pending_sends`).
+            let bot_senders: Vec<i64> = {
+                let cache = state.cache.read().await;
+                waiting_senders
+                    .iter()
+                    .copied()
+                    .filter(|sender_uid| {
+                        cache
+                            .users
+                            .get(sender_uid)
+                            .map(|user| user.is_bot)
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            };
+            for bot_uid in bot_senders {
+                if let Err(error) = crate::bot_e2ee::catch_up_pending_sends(
+                    &state,
+                    bot_uid,
+                    token.uid,
+                    &req.device_id,
+                    identity_version,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        bot_uid,
+                        target_uid = token.uid,
+                        error = %error,
+                        "bot e2ee deferred-send catch-up failed"
+                    );
+                }
+            }
+
             let _ = state.event_sender.send(Arc::new(BroadcastEvent::E2eIdentityChanged {
                 targets: waiting_senders.into_iter().collect(),
                 uid: token.uid,
@@ -776,6 +813,37 @@ impl ApiE2e {
         tx.commit().await.map_err(InternalServerError)?;
 
         if envelope_added {
+            // Bot context only: if the recipient of this deferred DM is a
+            // Bot, decrypt now and forward plaintext to *that Bot's own*
+            // webhook (see `crate::bot_e2ee::handle_inbound_bot_envelope`).
+            // Generic (non-Bot) webhook forwarding is untouched and keeps
+            // redacting E2E content to `e2e_opaque`.
+            let recipient_is_bot = {
+                let cache = state.cache.read().await;
+                cache
+                    .users
+                    .get(&req.recipient_uid)
+                    .map(|user| user.is_bot)
+                    .unwrap_or(false)
+            };
+            if recipient_is_bot {
+                if let Err(error) = crate::bot_e2ee::handle_inbound_bot_envelope(
+                    &state,
+                    mid.0,
+                    req.recipient_uid,
+                    &req.device_id,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        bot_uid = req.recipient_uid,
+                        mid = mid.0,
+                        error = %error,
+                        "bot e2ee inbound decrypt failed"
+                    );
+                }
+            }
+
             let _ = state.event_sender.send(Arc::new(BroadcastEvent::E2ePendingEnvelopeAdded {
                 targets: [sender_uid, req.recipient_uid].into_iter().collect(),
                 mid: mid.0,
