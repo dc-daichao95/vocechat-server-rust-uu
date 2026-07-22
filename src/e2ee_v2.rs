@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fmt};
 
+use chrono::TimeZone;
 use rc_msgdb::{MsgDb, PendingMessageMarker};
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -217,6 +218,7 @@ pub async fn reserve_mls_sequence(
 #[derive(Debug)]
 pub enum PendingProjectionError {
     MetadataConflict,
+    InvalidMarker,
     Sqlite(sqlx::Error),
     Marker(rc_msgdb::Error),
 }
@@ -225,6 +227,7 @@ impl fmt::Display for PendingProjectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MetadataConflict => formatter.write_str("E2E_PENDING_METADATA_CONFLICT"),
+            Self::InvalidMarker => formatter.write_str("invalid pending marker"),
             Self::Sqlite(error) => write!(formatter, "pending metadata SQLite error: {error}"),
             Self::Marker(error) => write!(formatter, "pending marker storage error: {error}"),
         }
@@ -239,6 +242,11 @@ pub async fn project_pending_dm_marker(
     pool: &SqlitePool,
     marker: PendingMessageMarker,
 ) -> Result<(), PendingProjectionError> {
+    let created_at = chrono::Utc
+        .timestamp_millis_opt(marker.created_at_millis)
+        .single()
+        .map(DateTime)
+        .ok_or(PendingProjectionError::InvalidMarker)?;
     let mut tx = pool.begin().await.map_err(PendingProjectionError::Sqlite)?;
     sqlx::query(
         r#"
@@ -250,7 +258,7 @@ pub async fn project_pending_dm_marker(
     .bind(marker.mid)
     .bind(marker.sender_uid)
     .bind(marker.target_uid)
-    .bind(DateTime::now())
+    .bind(created_at)
     .execute(&mut tx)
     .await
     .map_err(PendingProjectionError::Sqlite)?;

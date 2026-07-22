@@ -11,6 +11,7 @@ pub struct PendingMessageMarker {
     pub mid: i64,
     pub sender_uid: i64,
     pub target_uid: i64,
+    pub created_at_millis: i64,
 }
 
 impl<'a> Messages<'a> {
@@ -36,16 +37,17 @@ impl<'a> Messages<'a> {
     }
 
     pub fn send_to_dm(&self, from_uid: i64, to_uid: i64, msg: &[u8]) -> Result<i64> {
-        self.send_to_dm_inner(from_uid, to_uid, msg, false)
+        self.send_to_dm_inner(from_uid, to_uid, msg, None)
     }
 
     pub fn send_to_dm_with_pending_marker(
         &self,
         from_uid: i64,
         to_uid: i64,
+        created_at_millis: i64,
         msg: &[u8],
     ) -> Result<i64> {
-        self.send_to_dm_inner(from_uid, to_uid, msg, true)
+        self.send_to_dm_inner(from_uid, to_uid, msg, Some(created_at_millis))
     }
 
     fn send_to_dm_inner(
@@ -53,7 +55,7 @@ impl<'a> Messages<'a> {
         from_uid: i64,
         to_uid: i64,
         msg: &[u8],
-        pending: bool,
+        pending_created_at_millis: Option<i64>,
     ) -> Result<i64> {
         let id = self.db.generate_msg_id()?;
         let mut batch = Batch::default();
@@ -62,10 +64,10 @@ impl<'a> Messages<'a> {
             batch.insert(&key_user_msg(target_uid, id), msg);
         }
         batch.insert(&key_dm_msg(from_uid, to_uid, id), msg);
-        if pending {
+        if let Some(created_at_millis) = pending_created_at_millis {
             batch.insert(
                 &key_pending_message_marker(id),
-                &pending_marker_value(from_uid, to_uid),
+                &pending_marker_value(from_uid, to_uid, created_at_millis),
             );
         }
         self.db.db.apply_batch(batch)?;
@@ -76,16 +78,15 @@ impl<'a> Messages<'a> {
         let mut markers = Vec::new();
         for item in self.db.db.scan_prefix(b"PEND/") {
             let (key, value) = item?;
-            if let (Some(mid), Some((sender_uid, target_uid))) = (
-                decode_key_pending_message_marker(&key),
-                decode_pending_marker_value(&value),
-            ) {
-                markers.push(PendingMessageMarker {
-                    mid,
-                    sender_uid,
-                    target_uid,
-                });
-            }
+            let mid = decode_key_pending_message_marker(&key).ok_or(crate::Error::InvalidData)?;
+            let (sender_uid, target_uid, created_at_millis) =
+                decode_pending_marker_value(&value).ok_or(crate::Error::InvalidData)?;
+            markers.push(PendingMessageMarker {
+                mid,
+                sender_uid,
+                target_uid,
+                created_at_millis,
+            });
         }
         Ok(markers)
     }
@@ -283,20 +284,26 @@ fn decode_key_pending_message_marker(data: &[u8]) -> Option<i64> {
     Some(i64::from_be_bytes(data.try_into().ok()?))
 }
 
-fn pending_marker_value(sender_uid: i64, target_uid: i64) -> [u8; 16] {
-    let mut data = [0; 16];
+fn pending_marker_value(
+    sender_uid: i64,
+    target_uid: i64,
+    created_at_millis: i64,
+) -> [u8; 24] {
+    let mut data = [0; 24];
     data[0..8].copy_from_slice(&sender_uid.to_be_bytes());
     data[8..16].copy_from_slice(&target_uid.to_be_bytes());
+    data[16..24].copy_from_slice(&created_at_millis.to_be_bytes());
     data
 }
 
-fn decode_pending_marker_value(data: &[u8]) -> Option<(i64, i64)> {
-    if data.len() != 16 {
+fn decode_pending_marker_value(data: &[u8]) -> Option<(i64, i64, i64)> {
+    if data.len() != 24 {
         return None;
     }
     Some((
         i64::from_be_bytes(data[0..8].try_into().ok()?),
         i64::from_be_bytes(data[8..16].try_into().ok()?),
+        i64::from_be_bytes(data[16..24].try_into().ok()?),
     ))
 }
 
@@ -369,7 +376,7 @@ mod tests {
 
         let mid = db
             .messages()
-            .send_to_dm_with_pending_marker(7, 9, b"opaque")
+            .send_to_dm_with_pending_marker(7, 9, 1234, b"opaque")
             .unwrap();
 
         assert_eq!(db.messages().get(mid).unwrap(), Some(b"opaque".to_vec()));
@@ -379,6 +386,7 @@ mod tests {
                 mid,
                 sender_uid: 7,
                 target_uid: 9,
+                created_at_millis: 1234,
             }]
         );
 

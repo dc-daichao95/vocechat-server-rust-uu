@@ -818,7 +818,12 @@ fn internal_send_message(
                 state
                     .msg_db
                     .messages()
-                    .send_to_dm_with_pending_marker(from_uid, to_uid, &message)
+                    .send_to_dm_with_pending_marker(
+                        from_uid,
+                        to_uid,
+                        payload.created_at.timestamp_millis(),
+                        &message,
+                    )
             } else {
                 state
                     .msg_db

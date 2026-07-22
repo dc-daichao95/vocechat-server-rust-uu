@@ -1578,7 +1578,7 @@ mod tests {
             .state()
             .msg_db
             .messages()
-            .send_to_dm_with_pending_marker(uid, uid, b"opaque")
+            .send_to_dm_with_pending_marker(uid, uid, DateTime::now().timestamp_millis(), b"opaque")
             .unwrap();
         let empty_pool = sqlx::SqlitePool::connect("sqlite::memory:")
             .await
@@ -1644,7 +1644,12 @@ mod tests {
             .state()
             .msg_db
             .messages()
-            .send_to_dm_with_pending_marker(sender_uid, marker_target_uid, b"opaque")
+            .send_to_dm_with_pending_marker(
+                sender_uid,
+                marker_target_uid,
+                DateTime::now().timestamp_millis(),
+                b"opaque",
+            )
             .unwrap();
         sqlx::query(
             "insert into e2e_pending_message (mid, sender_uid, target_uid, created_at) values (?, ?, ?, ?)",
@@ -1700,6 +1705,7 @@ mod tests {
         let event = event.value().object();
         event.get("uid").assert_i64(uid1);
         event.get("device_id").assert_string("device-1");
+        event.get("identity_version").assert_i64(1);
     }
 
     #[tokio::test]
@@ -1739,6 +1745,7 @@ mod tests {
             event.get("mid").assert_i64(mid);
             event.get("recipient_uid").assert_i64(uid1);
             event.get("device_id").assert_string("device-1");
+            event.get("identity_version").assert_i64(1);
             event.get("envelope").assert_string("wrapped-content-key");
         }
     }
