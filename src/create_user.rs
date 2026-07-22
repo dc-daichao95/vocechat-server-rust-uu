@@ -160,7 +160,16 @@ impl State {
         create_user: CreateUser<'_>,
     ) -> Result<(i64, RwLockMappedWriteGuard<'_, CacheUser>), CreateUserError> {
         let email = create_user.create_by.email();
-        let password = create_user.create_by.password();
+        // All new password writes go through Argon2id, regardless of how the
+        // caller obtained the plaintext (register, admin create, bootstrap).
+        let password = match create_user.create_by.password() {
+            Some(plaintext) => Some(
+                crate::password_hash::hash(plaintext)
+                    .map_err(|_| poem::Error::from_status(StatusCode::INTERNAL_SERVER_ERROR))?,
+            ),
+            None => None,
+        };
+        let password = password.as_deref();
         let language = create_user.language.cloned().unwrap_or_default();
         let mut cache = self.cache.write().await;
         let is_guest = matches!(&create_user.create_by, CreateUserBy::Guest);
