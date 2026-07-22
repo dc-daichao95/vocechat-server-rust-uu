@@ -119,3 +119,36 @@ All endpoints require an admin token and operate on a Bot user's `uid`:
 
 Error responses are JSON: `{"code", "message_en", "message_zh"}` (every
 new admin message this task adds is bilingual).
+
+## Password storage: Argon2id migration (Task 10)
+
+Passwords are now hashed with **Argon2id** (`$argon2id$...`) on every new
+write (register, change-password, admin-set password, first-run
+bootstrap). Clients are unaffected — they still send the plaintext
+password over TLS on login; nothing changes on the client side.
+
+Older databases may still have rows where the `user.password` column
+holds a **legacy `MD5(MD5(plaintext))` hex digest** (32 lowercase hex
+characters) instead of a hash. The server still accepts those values:
+
+- Login compares the submitted plaintext against Argon2id, the legacy
+  double-MD5 digest, and (for a limited compatibility window) raw
+  plaintext equality — whichever the stored value happens to be.
+- The **first successful login after this upgrade** automatically
+  rewrites that account's stored value to Argon2id, in both the database
+  and the running server's in-memory user cache. No admin action or
+  downtime is required, and no account is locked out by the migration.
+
+**Operator guidance for a legacy account:**
+
+- Tell the affected user to simply **log in with their normal password**
+  once (via the normal client login screen). That single login upgrades
+  their stored credential to Argon2id automatically.
+- Do **not** ask a user to "log in with" or paste the double-MD5 hex
+  value itself — that hex string is not a password and is not accepted
+  as one; only the *original plaintext password* triggers the
+  legacy-match-and-upgrade path.
+- If the original plaintext password is genuinely unknown/lost, use the
+  normal password-reset flow (or `PUT /api/admin/user/:uid`
+  `{"password": "..."}` as an admin) instead — either path also stores
+  a fresh Argon2id hash.
