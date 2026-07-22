@@ -99,6 +99,9 @@ envy = "0.4.2"
 aes-gcm = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
 rand = "0.8"
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["rand_core"] }
+md-5 = "0.10"
 
 [target.'cfg(not(windows))'.dependencies]
 daemonize = "0.4.1"

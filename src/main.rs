@@ -6,6 +6,7 @@ mod api_key;
 mod bot_e2ee;
 mod config;
 mod create_user;
+mod password_hash;
 mod e2ee_v2;
 mod license;
 mod middleware;
