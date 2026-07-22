@@ -1,0 +1,38 @@
+{
+  "_expected_plaintext_for_test_only": "hello from Web, decrypt me on Flutter",
+  "_fixture_purpose": "Task 9 cross-client (Web -> Flutter) deferred DM wire compatibility",
+  "_recipient_local_identity_for_test_only": {
+    "ik_secret_b64": "yrAkGxwQGKbFeetqA1ZjgTFU9ALzEmi0HhqudRFaYDA=",
+    "otk_secret_b64": null,
+    "spk_secret_b64": "joDnp4/hlSRUVvTOPpwGq6KstcZ+XLmF6hx2ZdHquuc="
+  },
+  "body": {
+    "ciphertext_b64": "7nA/Yp5sjVDTADzP6xn6bh5xr78/ccaqeQ3GTMk6IUYfqmE2406/+L/XLpG9BZjusmrff1I=",
+    "metadata": {
+      "id": "018f8dd2-c87e-7b40-bf45-4df46c08e591:1721638400000",
+      "mime": "text/plain",
+      "sender_device_id": "web-device-alice-1"
+    },
+    "metadata_sha256_b64": "0NdBBl7K7vekrJWwXYsyO4aoas/UVsDgd8B8/PS5JGw=",
+    "nonce_b64": "o1f5LHGwGblY+FEy",
+    "wrap_envelope": {
+      "alg": "DEFERRED+AES-GCM",
+      "nonce_b64": "+O1Zy7dxGayXxHij",
+      "wrapped_key_b64": "T2wzLkCkQ6jCmi3kGfUlqCIA+7oVV24/rBICu6fkPN1vqp3Vfj8SDhD9EpI7t75i",
+      "x3dh_initial": {
+        "ephemeral_pub_b64": "+aXMh0lx0BvYPRwoU3pe+Z1Ab0d+OZEEP1hjCbCOWFA=",
+        "identity_dh_pub_b64": "BAMwls8iJ3t7rCC+kBxG4LkzkPwV9gvbKxp0QTD+Rzg=",
+        "used_one_time_prekey_id": null,
+        "used_signed_prekey_id": 1
+      }
+    }
+  },
+  "routing_properties": {
+    "algorithm": "DEFERRED+AES-GCM",
+    "e2e_version": 2,
+    "local_id": "018f8dd2-c87e-7b40-bf45-4df46c08e591",
+    "protocol": "dr-pending",
+    "sender_device_id": "web-device-alice-1",
+    "wire_class": "dr_envelope"
+  }
+}
