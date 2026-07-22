@@ -311,6 +311,14 @@ impl ApiAdminUser {
             .get_mut(&uid.0)
             .ok_or_else(|| Error::from(StatusCode::NOT_FOUND))?;
 
+        // Admin-set passwords are always stored as Argon2id.
+        let new_password_hash = match &req.password {
+            Some(plaintext) => {
+                Some(crate::password_hash::hash(plaintext).map_err(InternalServerError)?)
+            }
+            None => None,
+        };
+
         // begin transaction
         let mut tx = state.db_pool.begin().await.map_err(InternalServerError)?;
 
@@ -332,7 +340,7 @@ impl ApiAdminUser {
         );
 
         let mut query = sqlx::query(&sql);
-        if let Some(password) = &req.password {
+        if let Some(password) = &new_password_hash {
             query = query.bind(password);
         }
         if let Some(email) = &req.email {
@@ -389,7 +397,7 @@ impl ApiAdminUser {
         if let Some(name) = &req.0.name {
             cached_user.name = name.clone();
         }
-        if let Some(password) = &req.0.password {
+        if let Some(password) = &new_password_hash {
             cached_user.password = Some(password.clone());
         }
         if let Some(gender) = req.0.gender {
@@ -736,6 +744,15 @@ mod tests {
 
     use crate::test_harness::TestServer;
 
+    async fn fetch_stored_password(server: &TestServer, uid: i64) -> String {
+        let (password,): (String,) = sqlx::query_as("select password from user where uid = ?")
+            .bind(uid)
+            .fetch_one(&server.state().db_pool)
+            .await
+            .unwrap();
+        password
+    }
+
     #[tokio::test]
     async fn test_create_user() {
         let server = TestServer::new().await;
@@ -745,6 +762,14 @@ mod tests {
         let token = server.login("test1@voce.chat").await;
         let current_user = server.parse_token(token).await;
         assert_eq!(uid, current_user.uid);
+
+        // admin-created users get an Argon2id password, not plaintext.
+        let stored = fetch_stored_password(&server, uid).await;
+        assert!(
+            crate::password_hash::looks_like_argon2id(&stored),
+            "expected admin create to store an Argon2id hash, got: {} chars",
+            stored.len()
+        );
     }
 
     #[tokio::test]
@@ -880,6 +905,14 @@ mod tests {
             .send()
             .await;
         resp.assert_status_is_ok();
+
+        // admin-set password is stored as Argon2id, not plaintext.
+        let stored = fetch_stored_password(&server, uid1).await;
+        assert!(
+            crate::password_hash::looks_like_argon2id(&stored),
+            "expected admin update to store an Argon2id hash, got: {} chars",
+            stored.len()
+        );
 
         server
             .post("/api/token/login")
