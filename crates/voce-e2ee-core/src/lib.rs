@@ -6,6 +6,7 @@
 //!
 //! Generation-2-only runtime: Double Ratchet for DMs and MLS for channels.
 
+pub mod deferred;
 pub mod envelope;
 pub mod error;
 pub mod ffi;
@@ -15,6 +16,10 @@ pub mod mls;
 pub mod ratchet;
 pub mod x3dh;
 
+pub use deferred::{
+    deferred_decrypt, deferred_encrypt, deferred_unwrap_key, deferred_wrap_key, DeferredEncrypted,
+    DeferredEnvelope, DeferredLocalIdentity, DEFERRED_ALG,
+};
 pub use envelope::{E2eVersion, EnvelopeV2, ReplayWindow};
 pub use error::E2eError;
 pub use identity::{safety_number, IdentityPublic, IdentitySecret};

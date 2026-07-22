@@ -11,6 +11,10 @@ use std::os::raw::c_char;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 
+use crate::deferred::{
+    deferred_decrypt, deferred_encrypt, deferred_unwrap_key, deferred_wrap_key,
+    DeferredEnvelope, DeferredLocalIdentity,
+};
 use crate::envelope::EnvelopeV2;
 use crate::identity::{decode_x25519_pub, safety_number, IdentityPublic, IdentitySecret};
 use crate::ratchet::{RatchetHeader, RatchetState, RatchetStateDto};
@@ -57,6 +61,10 @@ pub fn dispatch(method: &str, args: &Value) -> String {
         "ratchet_decrypt" => ratchet_decrypt(args),
         "dm_session_open_initiator" => dm_session_open_initiator(args),
         "dm_session_open_responder" => dm_session_open_responder(args),
+        "deferred_encrypt" => deferred_encrypt_ffi(args),
+        "deferred_decrypt" => deferred_decrypt_ffi(args),
+        "deferred_wrap_key" => deferred_wrap_key_ffi(args),
+        "deferred_unwrap_key" => deferred_unwrap_key_ffi(args),
         method
             if method.starts_with("mls_")
                 || matches!(
@@ -332,6 +340,118 @@ fn decode32(args: &Value, key: &str) -> Result<[u8; 32], String> {
     bytes
         .try_into()
         .map_err(|_| format!("{key} must be 32 bytes"))
+}
+
+fn decode12(args: &Value, key: &str) -> Result<[u8; 12], String> {
+    let s = args[key].as_str().ok_or_else(|| format!("missing {key}"))?;
+    let bytes = B64.decode(s).map_err(|e| e.to_string())?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("{key} must be 12 bytes"))
+}
+
+/// `body_b64` (falls back to UTF-8 `body` string, matching `plaintext_bytes`).
+fn body_bytes(args: &Value) -> Result<Vec<u8>, String> {
+    if let Some(b64) = args["body_b64"].as_str() {
+        return B64.decode(b64).map_err(|e| e.to_string());
+    }
+    Ok(args["body"].as_str().unwrap_or("").as_bytes().to_vec())
+}
+
+fn deferred_encrypt_ffi(args: &Value) -> String {
+    let body = match body_bytes(args) {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let metadata = args["metadata"].clone();
+    match deferred_encrypt(&body, &metadata) {
+        Ok(enc) => ok(json!({
+            "content_key_b64": B64.encode(enc.content_key),
+            "nonce_b64": B64.encode(enc.nonce),
+            "ciphertext_b64": B64.encode(&enc.ciphertext),
+            "sha256_b64": B64.encode(enc.sha256),
+        })),
+        Err(e) => err(e),
+    }
+}
+
+fn deferred_decrypt_ffi(args: &Value) -> String {
+    let key = match decode32(args, "content_key_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let nonce = match decode12(args, "nonce_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let sha256 = match decode32(args, "sha256_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let ciphertext = match args["ciphertext_b64"].as_str() {
+        Some(s) => match B64.decode(s) {
+            Ok(b) => b,
+            Err(e) => return err(e),
+        },
+        None => return err("missing ciphertext_b64"),
+    };
+    match deferred_decrypt(&ciphertext, &key, &nonce, &sha256) {
+        Ok(body) => {
+            let mut out = json!({ "body_b64": B64.encode(&body) });
+            if let Ok(s) = String::from_utf8(body) {
+                out["body"] = json!(s);
+            }
+            ok(out)
+        }
+        Err(e) => err(e),
+    }
+}
+
+fn deferred_wrap_key_ffi(args: &Value) -> String {
+    let content_key = match decode32(args, "content_key_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let bundle: PreKeyBundle = match serde_json::from_value(args["recipient_bundle"].clone()) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    match deferred_wrap_key(&content_key, &bundle) {
+        Ok(envelope) => ok(json!({ "envelope": envelope })),
+        Err(e) => err(e),
+    }
+}
+
+fn deferred_unwrap_key_ffi(args: &Value) -> String {
+    let envelope: DeferredEnvelope = match serde_json::from_value(args["envelope"].clone()) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let local = &args["local_identity"];
+    let ik_secret = match decode32(local, "ik_secret_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let spk_secret = match decode32(local, "spk_secret_b64") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let otk_secret = match local.get("otk_secret_b64") {
+        Some(v) if !v.is_null() => match decode32(local, "otk_secret_b64") {
+            Ok(b) => Some(b),
+            Err(e) => return err(e),
+        },
+        _ => None,
+    };
+    let local_identity = DeferredLocalIdentity {
+        ik_secret,
+        spk_secret,
+        otk_secret,
+    };
+    match deferred_unwrap_key(&envelope, &local_identity) {
+        Ok(content_key) => ok(json!({ "content_key_b64": B64.encode(content_key) })),
+        Err(e) => err(e),
+    }
 }
 
 fn to_c_string(s: String) -> *mut c_char {
